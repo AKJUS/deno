@@ -33,6 +33,8 @@ use deno_runtime::deno_io::fs::File as DenoFile;
 use deno_runtime::deno_io::fs::FsError;
 use deno_runtime::deno_io::fs::FsResult;
 use deno_runtime::deno_io::fs::FsStat;
+use deno_runtime::deno_napi::DenoRtNativeAddonLoader;
+use deno_runtime::deno_napi::DenoRtNativeAddonLoaderRc;
 use sys_traits::boxed::BoxedFsDirEntry;
 use sys_traits::boxed::BoxedFsMetadataValue;
 use sys_traits::boxed::FsMetadataBoxed;
@@ -46,6 +48,10 @@ pub struct DenoRtSys(Arc<FileBackedVfs>);
 impl DenoRtSys {
   pub fn new(vfs: Arc<FileBackedVfs>) -> Self {
     Self(vfs)
+  }
+
+  pub fn as_deno_rt_native_addon_loader(&self) -> DenoRtNativeAddonLoaderRc {
+    self.0.clone()
   }
 
   pub fn is_specifier_in_vfs(&self, specifier: &Url) -> bool {
@@ -1140,6 +1146,22 @@ impl deno_io::fs::File for FileBackedVfsFile {
     Err(FsError::NotSupported)
   }
 
+  fn chown_sync(
+    self: Rc<Self>,
+    _uid: Option<u32>,
+    _gid: Option<u32>,
+  ) -> FsResult<()> {
+    Err(FsError::NotSupported)
+  }
+
+  async fn chown_async(
+    self: Rc<Self>,
+    _uid: Option<u32>,
+    _gid: Option<u32>,
+  ) -> FsResult<()> {
+    Err(FsError::NotSupported)
+  }
+
   fn seek_sync(self: Rc<Self>, pos: SeekFrom) -> FsResult<u64> {
     self.seek(pos).map_err(|err| err.into())
   }
@@ -1462,6 +1484,16 @@ impl FileBackedVfs {
       VfsEntryRef::Symlink(_) => unreachable!(),
       VfsEntryRef::File(file) => Ok(file),
     }
+  }
+}
+
+impl DenoRtNativeAddonLoader for FileBackedVfs {
+  fn load_if_in_vfs(&self, path: &Path) -> Option<Cow<'static, [u8]>> {
+    if !self.is_path_within(path) {
+      return None;
+    }
+    let file = self.file_entry(path).ok()?;
+    self.read_file_offset_with_len(file.offset).ok()
   }
 }
 
