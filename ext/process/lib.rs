@@ -20,6 +20,7 @@ use deno_core::op2;
 use deno_core::serde_json;
 use deno_core::AsyncMutFuture;
 use deno_core::AsyncRefCell;
+use deno_core::JsBuffer;
 use deno_core::OpState;
 use deno_core::RcRef;
 use deno_core::Resource;
@@ -193,6 +194,8 @@ pub struct SpawnArgs {
   #[serde(flatten)]
   stdio: ChildStdio,
 
+  input: Option<JsBuffer>,
+
   extra_stdio: Vec<Stdio>,
   detached: bool,
   needs_npm_process_state: bool,
@@ -251,7 +254,7 @@ pub enum ProcessError {
   BorrowMut(std::cell::BorrowMutError),
   #[class(generic)]
   #[error(transparent)]
-  Which(which::Error),
+  Which(deno_permissions::which::Error),
   #[class(type)]
   #[error("Child process has already terminated.")]
   ChildProcessAlreadyTerminated,
@@ -437,6 +440,8 @@ fn create_command(
 
   if args.stdio.stdin.is_ipc() {
     args.ipc = Some(0);
+  } else if args.input.is_some() {
+    command.stdin(std::process::Stdio::piped());
   } else {
     command.stdin(args.stdio.stdin.as_stdio(state)?);
   }
@@ -505,19 +510,21 @@ fn create_command(
     }
 
     let detached = args.detached;
-    command.pre_exec(move || {
-      if detached {
-        libc::setsid();
-      }
-      for &(src, dst) in &fds_to_dup {
-        if src >= 0 && dst >= 0 {
-          let _fd = libc::dup2(src, dst);
-          libc::close(src);
+    if detached || !fds_to_dup.is_empty() || args.gid.is_some() {
+      command.pre_exec(move || {
+        if detached {
+          libc::setsid();
         }
-      }
-      libc::setgroups(0, std::ptr::null());
-      Ok(())
-    });
+        for &(src, dst) in &fds_to_dup {
+          if src >= 0 && dst >= 0 {
+            let _fd = libc::dup2(src, dst);
+            libc::close(src);
+          }
+        }
+        libc::setgroups(0, std::ptr::null());
+        Ok(())
+      });
+    }
 
     Ok((command, ipc_rid, extra_pipe_rids, fds_to_close))
   }
@@ -795,9 +802,14 @@ fn resolve_cmd(cmd: &str, env: &RunEnv) -> Result<PathBuf, ProcessError> {
     Ok(resolve_path(cmd, &env.cwd))
   } else {
     let path = env.envs.get(&EnvVarKey::new(OsString::from("PATH")));
-    match which::which_in(cmd, path, &env.cwd) {
+    match deno_permissions::which::which_in(
+      sys_traits::impls::RealSys,
+      cmd,
+      path.cloned(),
+      env.cwd.clone(),
+    ) {
       Ok(cmd) => Ok(cmd),
-      Err(which::Error::CannotFindBinaryPath) => {
+      Err(deno_permissions::which::Error::CannotFindBinaryPath) => {
         Err(std::io::Error::from(std::io::ErrorKind::NotFound).into())
       }
       Err(err) => Err(ProcessError::Which(err)),
@@ -936,13 +948,28 @@ fn op_spawn_sync(
 ) -> Result<SpawnOutput, ProcessError> {
   let stdout = matches!(args.stdio.stdout, StdioOrRid::Stdio(Stdio::Piped));
   let stderr = matches!(args.stdio.stderr, StdioOrRid::Stdio(Stdio::Piped));
+  let input = args.input.clone();
   let (mut command, _, _, _) =
     create_command(state, args, "Deno.Command().outputSync()")?;
-  let output = command.output().map_err(|e| ProcessError::SpawnFailed {
+
+  let mut child = command.spawn().map_err(|e| ProcessError::SpawnFailed {
     command: command.get_program().to_string_lossy().to_string(),
     error: Box::new(e.into()),
   })?;
-
+  if let Some(input) = input {
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+      ProcessError::Io(std::io::Error::other("stdin is not available"))
+    })?;
+    stdin.write_all(&input)?;
+    stdin.flush()?;
+  }
+  let output =
+    child
+      .wait_with_output()
+      .map_err(|e| ProcessError::SpawnFailed {
+        command: command.get_program().to_string_lossy().to_string(),
+        error: Box::new(e.into()),
+      })?;
   Ok(SpawnOutput {
     status: output.status.try_into()?,
     stdout: if stdout {

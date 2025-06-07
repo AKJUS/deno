@@ -103,7 +103,7 @@ fn extract_files_from_fenced_blocks(
   // or not by checking for the presence of capturing groups in the matches.
   let blocks_regex =
     lazy_regex::regex!(r"(?s)<!--.*?-->|```([^\r\n]*)\r?\n([\S\s]*?)```");
-  let lines_regex = lazy_regex::regex!(r"(?:\# ?)?(.*)");
+  let lines_regex = lazy_regex::regex!(r"(((#!+).*)|(?:# ?)?(.*))");
 
   extract_files_from_regex_blocks(
     specifier,
@@ -130,7 +130,8 @@ fn extract_files_from_source_comments(
   })?;
   let comments = parsed_source.comments().get_vec();
   let blocks_regex = lazy_regex::regex!(r"```([^\r\n]*)\r?\n([\S\s]*?)```");
-  let lines_regex = lazy_regex::regex!(r"(?:\* ?)(?:\# ?)?(.*)");
+  let lines_regex =
+    lazy_regex::regex!(r"(?:\* ?)((#!+).*)|(?:\* ?)(?:\# ?)?(.*)");
 
   let files = comments
     .iter()
@@ -213,7 +214,7 @@ fn extract_files_from_regex_blocks(
       // TODO(caspervonb) generate an inline source map
       let mut file_source = String::new();
       for line in lines_regex.captures_iter(text) {
-        let text = line.get(1).unwrap();
+        let text = line.get(1).or_else(|| line.get(3)).unwrap();
         writeln!(file_source, "{}", text.as_str()).unwrap();
       }
 
@@ -231,6 +232,7 @@ fn extract_files_from_regex_blocks(
 
       Some(File {
         url: file_specifier,
+        mtime: None,
         maybe_headers: None,
         source: file_source.into_bytes().into(),
       })
@@ -595,6 +597,7 @@ fn generate_pseudo_file(
 
   Ok(File {
     url: file.specifier,
+    mtime: None,
     maybe_headers: None,
     source: source.into_bytes().into(),
   })
@@ -1202,6 +1205,7 @@ Deno.test("file:///main.ts$3-7.ts", async ()=>{
       let file = File {
         url: ModuleSpecifier::parse(test.input.specifier).unwrap(),
         maybe_headers: None,
+        mtime: None,
         source: test.input.source.as_bytes().into(),
       };
       let got_decoded = extract_doc_tests(file)
@@ -1438,6 +1442,7 @@ add('1', '2');
       let file = File {
         url: ModuleSpecifier::parse(test.input.specifier).unwrap(),
         maybe_headers: None,
+        mtime: None,
         source: test.input.source.as_bytes().into(),
       };
       let got_decoded = extract_snippet_files(file)
