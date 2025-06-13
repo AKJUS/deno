@@ -7,7 +7,7 @@ use deno_ast::MediaType;
 use deno_ast::ModuleExportsAndReExports;
 use deno_ast::ModuleSpecifier;
 use deno_error::JsErrorBox;
-use deno_graph::ParsedSourceStore;
+use deno_graph::ast::ParsedSourceStore;
 use deno_resolver::npm::DenoInNpmPackageChecker;
 use deno_runtime::deno_fs;
 use node_resolver::analyze::CjsAnalysis as ExtNodeCjsAnalysis;
@@ -87,6 +87,7 @@ impl CliCjsCodeAnalyzer {
     source: &str,
     esm_analysis_mode: EsmAnalysisMode,
   ) -> Result<CliCjsAnalysis, JsErrorBox> {
+    let source = source.strip_prefix('\u{FEFF}').unwrap_or(source); // strip BOM
     let source_hash = CacheDBHash::from_hashable(source);
     if let Some(analysis) =
       self.cache.get_cjs_analysis(specifier.as_str(), source_hash)
