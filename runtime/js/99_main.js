@@ -8,6 +8,7 @@ import { core, internals, primordials } from "ext:core/mod.js";
 const ops = core.ops;
 import {
   op_bootstrap_args,
+  op_bootstrap_is_from_unconfigured_runtime,
   op_bootstrap_no_color,
   op_bootstrap_pid,
   op_bootstrap_stderr_no_color,
@@ -115,6 +116,8 @@ ObjectDefineProperties(Symbol, {
     configurable: false,
   },
 });
+
+internals.isFromUnconfiguredRuntime = op_bootstrap_is_from_unconfigured_runtime;
 
 // https://docs.rs/log/latest/log/enum.Level.html
 const LOG_LEVELS = {
@@ -261,7 +264,7 @@ async function pollForMessages() {
 let loadedMainWorkerScript = false;
 
 function importScripts(...urls) {
-  if (op_worker_get_type() === "module") {
+  if (op_worker_get_type() !== "classic") {
     throw new TypeError("Cannot import scripts in a module worker");
   }
 
@@ -802,18 +805,20 @@ function bootstrapMainRuntime(runtimeOptions, warmup = false) {
       9: servePort,
       10: serveHost,
       11: serveIsMain,
-      12: serveWorkerCount,
+      12: serveWorkerCountOrIndex,
       13: otelConfig,
+      15: standalone,
     } = runtimeOptions;
 
+    denoNs.build.standalone = standalone;
+
     if (mode === executionModes.serve) {
-      if (serveIsMain && serveWorkerCount) {
-        // deno-lint-ignore no-global-assign
-        console = new internalConsole.Console((msg, level) =>
-          core.print("[serve-worker-0 ] " + msg, level > 1)
-        );
-      } else if (serveWorkerCount !== null) {
-        const base = `serve-worker-${serveWorkerCount + 1}`;
+      const hasMultipleThreads = serveIsMain
+        ? serveWorkerCountOrIndex > 0 // count > 0
+        : true;
+      if (hasMultipleThreads) {
+        const serveLogIndex = serveIsMain ? 0 : (serveWorkerCountOrIndex + 1);
+        const base = `serve-worker-${serveLogIndex}`;
         // 15 = "serve-worker-nn".length, assuming
         // serveWorkerCount < 100
         const prefix = `[${StringPrototypePadEnd(base, 15, " ")}]`;
@@ -864,7 +869,13 @@ function bootstrapMainRuntime(runtimeOptions, warmup = false) {
             );
           }
           if (mode === executionModes.serve) {
-            serve({ servePort, serveHost, serveIsMain, serveWorkerCount });
+            serve({
+              servePort,
+              serveHost,
+              workerCountWhenMain: serveIsMain
+                ? serveWorkerCountOrIndex
+                : undefined,
+            });
           }
         }
       });
@@ -982,6 +993,7 @@ function bootstrapWorkerRuntime(
   name,
   internalName,
   workerId,
+  workerType,
   maybeWorkerMetadata,
   warmup = false,
 ) {
@@ -999,8 +1011,8 @@ function bootstrapWorkerRuntime(
       6: argv0,
       7: nodeDebug,
       13: otelConfig,
-      14: closeOnIdle_,
     } = runtimeOptions;
+    closeOnIdle = runtimeOptions[14];
 
     performance.setTimeOrigin();
     globalThis_ = globalThis;
@@ -1011,6 +1023,10 @@ function bootstrapWorkerRuntime(
     hasBootstrapped = true;
 
     exposeUnstableFeaturesForWindowOrWorkerGlobalScope(unstableFeatures);
+    if (workerType === "node") {
+      delete workerRuntimeGlobalProperties["WorkerGlobalScope"];
+      delete workerRuntimeGlobalProperties["self"];
+    }
     ObjectDefineProperties(globalThis, workerRuntimeGlobalProperties);
     ObjectDefineProperties(globalThis, {
       name: core.propWritable(name),
@@ -1031,8 +1047,8 @@ function bootstrapWorkerRuntime(
 
     core.wrapConsole(globalThis.console, core.v8Console);
 
-    event.defineEventHandler(self, "message");
-    event.defineEventHandler(self, "error", undefined, true);
+    event.defineEventHandler(globalThis, "message");
+    event.defineEventHandler(globalThis, "error", undefined, true);
 
     // `Deno.exit()` is an alias to `self.close()`. Setting and exit
     // code using an op in worker context is a no-op.
@@ -1052,7 +1068,6 @@ function bootstrapWorkerRuntime(
 
     globalThis.pollForMessages = pollForMessages;
     globalThis.hasMessageEventListener = hasMessageEventListener;
-    closeOnIdle = closeOnIdle_;
 
     for (let i = 0; i <= unstableFeatures.length; i++) {
       const id = unstableFeatures[i];
@@ -1129,6 +1144,7 @@ removeImportedOps();
 // Run the warmup path through node and runtime/worker bootstrap functions
 bootstrapMainRuntime(undefined, true);
 bootstrapWorkerRuntime(
+  undefined,
   undefined,
   undefined,
   undefined,
