@@ -18,6 +18,8 @@ import {
 } from "ext:deno_node/internal/errors.ts";
 import { isDeepEqual } from "ext:deno_node/internal/util/comparisons.ts";
 import { primordials } from "ext:core/mod.js";
+import { CallTracker } from "ext:deno_node/internal/assert/calltracker.js";
+import { deprecate } from "node:util";
 
 const { ObjectPrototypeIsPrototypeOf } = primordials;
 
@@ -63,9 +65,10 @@ function toNode(
     expected: unknown;
     message?: string | Error;
     operator?: string;
+    stackStartFn?: Function;
   },
 ) {
-  const { operator, message, actual, expected } = opts || {};
+  const { operator, message, actual, expected, stackStartFn } = opts || {};
   try {
     fn();
   } catch (e) {
@@ -76,6 +79,7 @@ function toNode(
           message,
           actual,
           expected,
+          stackStartFn,
         });
       } else if (message instanceof Error) {
         throw message;
@@ -85,6 +89,7 @@ function toNode(
           message: e.message,
           actual,
           expected,
+          stackStartFn,
         });
       }
     }
@@ -98,10 +103,11 @@ function assert(actual: unknown, message?: string | Error): asserts actual {
       message: "No value argument passed to `assert.ok()`",
     });
   }
-  toNode(
-    () => asserts.assert(actual),
-    { message, actual, expected: true },
-  );
+  if (actual) {
+    return;
+  }
+
+  equal(actual, true, message);
 }
 const ok = assert;
 
@@ -270,6 +276,7 @@ function equal(
       operator: "==",
       actual,
       expected,
+      stackStartFn: equal,
     },
   );
 }
@@ -376,11 +383,16 @@ function deepStrictEqual(
     throw new ERR_MISSING_ARGS("actual", "expected");
   }
 
-  toNode(
-    () => asserts.assertEquals(actual, expected),
-    { message, actual, expected, operator: "deepStrictEqual" },
-  );
+  if (!asserts.equal(actual, expected)) {
+    throw new AssertionError({
+      message,
+      actual,
+      expected,
+      operator: "deepStrictEqual",
+    });
+  }
 }
+
 function notDeepStrictEqual(
   actual: unknown,
   expected: unknown,
@@ -882,8 +894,15 @@ function isValidThenable(maybeThennable: any): boolean {
   return isThenable && typeof maybeThennable !== "function";
 }
 
+const CallTracker_ = deprecate(
+  CallTracker,
+  "assert.CallTracker is deprecated.",
+  "DEP0173",
+);
+
 Object.assign(strict, {
   AssertionError,
+  CallTracker: CallTracker_,
   deepEqual: deepStrictEqual,
   deepStrictEqual,
   doesNotMatch,
@@ -906,6 +925,7 @@ Object.assign(strict, {
 
 export default Object.assign(assert, {
   AssertionError,
+  CallTracker: CallTracker_,
   deepEqual,
   deepStrictEqual,
   doesNotMatch,
@@ -928,6 +948,7 @@ export default Object.assign(assert, {
 
 export {
   AssertionError,
+  CallTracker_ as CallTracker,
   deepEqual,
   deepStrictEqual,
   doesNotMatch,
