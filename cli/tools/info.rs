@@ -16,13 +16,17 @@ use deno_graph::Dependency;
 use deno_graph::GraphKind;
 use deno_graph::Module;
 use deno_graph::ModuleError;
+use deno_graph::ModuleErrorKind;
 use deno_graph::ModuleGraph;
 use deno_graph::Resolution;
 use deno_lib::util::checksum;
+use deno_lib::version::DENO_VERSION_INFO;
 use deno_npm::npm_rc::ResolvedNpmRc;
 use deno_npm::resolution::NpmResolutionSnapshot;
 use deno_npm::NpmPackageId;
 use deno_npm::NpmResolutionPackage;
+use deno_npm_installer::graph::NpmCachingStrategy;
+use deno_resolver::display::DisplayTreeNode;
 use deno_resolver::DenoResolveErrorKind;
 use deno_semver::npm::NpmPackageNvReference;
 use deno_semver::npm::NpmPackageReqReference;
@@ -35,7 +39,6 @@ use crate::display;
 use crate::factory::CliFactory;
 use crate::graph_util::graph_exit_integrity_errors;
 use crate::npm::CliManagedNpmResolver;
-use crate::util::display::DisplayTreeNode;
 
 const JSON_SCHEMA_VERSION: u8 = 1;
 
@@ -99,6 +102,13 @@ pub async fn info(
                 .into(),
             );
           }
+          deno_package_json::PackageJsonDepValue::JsrReq(_) => {
+            return Err(
+              DenoResolveErrorKind::UnsupportedPackageJsonJsrReq
+                .into_box()
+                .into(),
+            );
+          }
           deno_package_json::PackageJsonDepValue::Workspace(version_req) => {
             let pkg_folder = resolver
               .resolve_workspace_pkg_json_folder_for_pkg_json_dep(
@@ -135,14 +145,15 @@ pub async fn info(
       None => resolve_url_or_path(&specifier, cli_options.initial_cwd())?,
     };
 
-    let mut loader = module_graph_builder.create_graph_loader();
+    let mut loader =
+      module_graph_builder.create_graph_loader_with_root_permissions();
     loader.enable_loading_cache_info(); // for displaying the cache information
     let graph = module_graph_creator
       .create_graph_with_loader(
         GraphKind::All,
         vec![specifier],
         &mut loader,
-        crate::graph_util::NpmCachingStrategy::Eager,
+        NpmCachingStrategy::Eager,
       )
       .await?;
 
@@ -176,7 +187,7 @@ pub async fn info(
       let mut output = String::new();
       GraphDisplayContext::write(
         &graph,
-        maybe_npm_info.as_ref().map(|(r, s)| (*r, s)),
+        maybe_npm_info.as_ref().map(|(r, s)| (r.as_ref(), s)),
         &mut output,
       )?;
       display::write_to_stdout_ignore_sigpipe(output.as_bytes())?;
@@ -198,6 +209,7 @@ fn print_cache_info(
   json: bool,
   location: Option<&deno_core::url::Url>,
 ) -> Result<(), AnyError> {
+  let deno_version = DENO_VERSION_INFO.deno;
   let dir = factory.deno_dir()?;
   #[allow(deprecated)]
   let modules_cache = factory.global_http_cache()?.dir_path();
@@ -218,6 +230,7 @@ fn print_cache_info(
   if json {
     let mut json_output = serde_json::json!({
       "version": JSON_SCHEMA_VERSION,
+      "denoVersion": deno_version,
       "denoDir": deno_dir,
       "modulesCache": modules_cache,
       "npmCache": npm_cache,
@@ -233,6 +246,7 @@ fn print_cache_info(
 
     display::write_json_to_stdout(&json_output)
   } else {
+    println!("{} {}", colors::bold("Deno version:"), deno_version);
     println!("{} {}", colors::bold("DENO_DIR location:"), deno_dir);
     println!(
       "{} {}",
@@ -537,7 +551,7 @@ impl<'a> GraphDisplayContext<'a> {
         Ok(())
       }
       Err(err) => {
-        if let ModuleError::Missing(_, _) = *err {
+        if let ModuleErrorKind::Missing { .. } = err.as_kind() {
           bail!("module could not be found");
         } else {
           bail!("{:#}", err);
@@ -687,11 +701,11 @@ impl<'a> GraphDisplayContext<'a> {
     specifier: &ModuleSpecifier,
   ) -> DisplayTreeNode {
     self.seen.insert(specifier.to_string());
-    match err {
-      ModuleError::InvalidTypeAssertion { .. } => {
+    match err.as_kind() {
+      ModuleErrorKind::InvalidTypeAssertion { .. } => {
         self.build_error_msg(specifier, "(invalid import attribute)")
       }
-      ModuleError::LoadingErr(_, _, err) => {
+      ModuleErrorKind::Load { err, .. } => {
         use deno_graph::ModuleLoadError::*;
         let message = match err {
           HttpsChecksumIntegrity(_) => "(checksum integrity error)",
@@ -704,22 +718,22 @@ impl<'a> GraphDisplayContext<'a> {
             }
           }
           Jsr(_) => "(loading error)",
-          NodeUnknownBuiltinModule(_) => "(unknown node built-in error)",
           Npm(_) => "(npm loading error)",
           TooManyRedirects => "(too many redirects error)",
         };
         self.build_error_msg(specifier, message.as_ref())
       }
-      ModuleError::ParseErr(_, _) | ModuleError::WasmParseErr(_, _) => {
+      ModuleErrorKind::Parse { .. } | ModuleErrorKind::WasmParse { .. } => {
         self.build_error_msg(specifier, "(parsing error)")
       }
-      ModuleError::UnsupportedImportAttributeType { .. } => {
+      ModuleErrorKind::UnsupportedImportAttributeType { .. } => {
         self.build_error_msg(specifier, "(unsupported import attribute)")
       }
-      ModuleError::UnsupportedMediaType { .. } => {
+      ModuleErrorKind::UnsupportedMediaType { .. } => {
         self.build_error_msg(specifier, "(unsupported)")
       }
-      ModuleError::Missing(_, _) | ModuleError::MissingDynamic(_, _) => {
+      ModuleErrorKind::Missing { .. }
+      | ModuleErrorKind::MissingDynamic { .. } => {
         self.build_error_msg(specifier, "(missing)")
       }
     }
