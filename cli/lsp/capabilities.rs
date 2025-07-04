@@ -37,8 +37,8 @@ fn code_action_capabilities(
     .unwrap_or(CodeActionProviderCapability::Simple(true))
 }
 
-pub fn semantic_tokens_registration_options(
-) -> SemanticTokensRegistrationOptions {
+pub fn semantic_tokens_registration_options()
+-> SemanticTokensRegistrationOptions {
   const LANGUAGES: [&str; 4] = [
     "javascript",
     "javascriptreact",
@@ -200,6 +200,25 @@ pub fn server_capabilities(
     diagnostic_provider: None,
     inline_value_provider: None,
     inline_completion_provider: None,
-    notebook_document_sync: None,
+    notebook_document_sync: Some(OneOf::Left(NotebookDocumentSyncOptions {
+      notebook_selector: vec![NotebookSelector::ByCells {
+        notebook: None,
+        cells: vec![
+          NotebookCellSelector {
+            language: "javascript".to_string(),
+          },
+          NotebookCellSelector {
+            language: "javascriptreact".to_string(),
+          },
+          NotebookCellSelector {
+            language: "typescript".to_string(),
+          },
+          NotebookCellSelector {
+            language: "typescriptreact".to_string(),
+          },
+        ],
+      }],
+      save: Some(true),
+    })),
   }
 }

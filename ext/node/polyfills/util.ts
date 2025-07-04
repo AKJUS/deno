@@ -1,6 +1,7 @@
 // Copyright 2018-2025 the Deno authors. MIT license.
 
 import { primordials } from "ext:core/mod.js";
+import { op_node_call_is_from_dependency } from "ext:core/ops";
 const {
   ArrayIsArray,
   ArrayPrototypeJoin,
@@ -28,12 +29,10 @@ const {
   StringPrototypePadStart,
   StringPrototypeToWellFormed,
   PromiseResolve,
+  PromiseWithResolvers,
 } = primordials;
 
-import {
-  createDeferredPromise,
-  promisify,
-} from "ext:deno_node/internal/util.mjs";
+import { promisify } from "ext:deno_node/internal/util.mjs";
 import { callbackify } from "ext:deno_node/_util/_util_callbackify.js";
 import { debuglog } from "ext:deno_node/internal/util/debuglog.ts";
 import {
@@ -274,7 +273,7 @@ export function deprecate(fn: any, msg: string, code?: any) {
   let warned = false;
   // deno-lint-ignore no-explicit-any
   function deprecated(this: any, ...args: any[]) {
-    if (!warned) {
+    if (!warned && !op_node_call_is_from_dependency()) {
       warned = true;
       if (code !== undefined) {
         if (!SetPrototypeHas(codesWarned, code)) {
@@ -317,7 +316,7 @@ export async function aborted(
   if (signal.aborted) {
     return PromiseResolve();
   }
-  const abortPromise = createDeferredPromise();
+  const abortPromise = PromiseWithResolvers();
   signal[abortSignal.add](abortPromise.resolve);
   return abortPromise.promise;
 }

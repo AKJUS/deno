@@ -8,6 +8,8 @@ use std::io::SeekFrom;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(unix)]
+use std::process::Stdio as StdStdio;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,11 +35,15 @@ use deno_runtime::deno_io::fs::File as DenoFile;
 use deno_runtime::deno_io::fs::FsError;
 use deno_runtime::deno_io::fs::FsResult;
 use deno_runtime::deno_io::fs::FsStat;
+use deno_runtime::deno_napi::DenoRtNativeAddonLoader;
+use deno_runtime::deno_napi::DenoRtNativeAddonLoaderRc;
+#[cfg(windows)]
+use deno_subprocess_windows::Stdio as StdStdio;
+use sys_traits::FsCopy;
 use sys_traits::boxed::BoxedFsDirEntry;
 use sys_traits::boxed::BoxedFsMetadataValue;
 use sys_traits::boxed::FsMetadataBoxed;
 use sys_traits::boxed::FsReadDirBoxed;
-use sys_traits::FsCopy;
 use url::Url;
 
 #[derive(Debug, Clone)]
@@ -46,6 +52,10 @@ pub struct DenoRtSys(Arc<FileBackedVfs>);
 impl DenoRtSys {
   pub fn new(vfs: Arc<FileBackedVfs>) -> Self {
     Self(vfs)
+  }
+
+  pub fn as_deno_rt_native_addon_loader(&self) -> DenoRtNativeAddonLoaderRc {
+    self.0.clone()
   }
 
   pub fn is_specifier_in_vfs(&self, specifier: &Url) -> bool {
@@ -183,6 +193,16 @@ impl FileSystem for DenoRtSys {
   ) -> FsResult<()> {
     self.error_if_in_vfs(&path)?;
     RealFs.chown_async(path, uid, gid).await
+  }
+
+  fn lchmod_sync(&self, path: &Path, mode: u32) -> FsResult<()> {
+    self.error_if_in_vfs(path)?;
+    RealFs.lchmod_sync(path, mode)
+  }
+
+  async fn lchmod_async(&self, path: PathBuf, mode: u32) -> FsResult<()> {
+    self.error_if_in_vfs(&path)?;
+    RealFs.lchmod_async(path, mode).await
   }
 
   fn lchown_sync(
@@ -576,7 +596,7 @@ impl sys_traits::BaseFsReadDir for DenoRtSys {
     &self,
     path: &Path,
   ) -> std::io::Result<
-    Box<dyn Iterator<Item = std::io::Result<Self::ReadDirEntry>> + '_>,
+    Box<dyn Iterator<Item = std::io::Result<Self::ReadDirEntry>>>,
   > {
     if self.0.is_path_within(path) {
       let entries = self.0.read_dir_with_metadata(path)?;
@@ -702,6 +722,21 @@ impl sys_traits::FsFileAsRaw for FsFileAdapter {
     match self {
       Self::Real(file) => file.fs_file_as_raw_fd(),
       Self::Vfs(_) => None,
+    }
+  }
+}
+
+impl sys_traits::FsFileMetadata for FsFileAdapter {
+  #[inline]
+  fn fs_file_metadata(&self) -> std::io::Result<BoxedFsMetadataValue> {
+    match self {
+      Self::Real(file) => file.fs_file_metadata(),
+      Self::Vfs(file) => Ok(BoxedFsMetadataValue::new(FileBackedVfsMetadata {
+        file_type: sys_traits::FileType::File,
+        name: file.file.name.clone(),
+        len: file.file.offset.len,
+        mtime: file.file.mtime,
+      })),
     }
   }
 }
@@ -884,9 +919,18 @@ impl sys_traits::ThreadSleep for DenoRtSys {
 }
 
 impl sys_traits::EnvCurrentDir for DenoRtSys {
+  #[inline]
   fn env_current_dir(&self) -> std::io::Result<PathBuf> {
     #[allow(clippy::disallowed_types)] // ok because we're implementing the fs
     sys_traits::impls::RealSys.env_current_dir()
+  }
+}
+
+impl sys_traits::EnvHomeDir for DenoRtSys {
+  #[inline]
+  fn env_home_dir(&self) -> Option<PathBuf> {
+    #[allow(clippy::disallowed_types)] // ok because we're implementing the fs
+    sys_traits::impls::RealSys.env_home_dir()
   }
 }
 
@@ -929,10 +973,7 @@ impl VfsRoot {
       match entry {
         VfsEntryRef::Symlink(symlink) => {
           if !seen.insert(path.to_path_buf()) {
-            return Err(std::io::Error::new(
-              std::io::ErrorKind::Other,
-              "circular symlinks",
-            ));
+            return Err(std::io::Error::other("circular symlinks"));
           }
           path = Cow::Owned(symlink.resolve_dest_from_root(&self.root_path));
         }
@@ -1049,7 +1090,10 @@ impl FileBackedVfsFile {
         if offset >= 0 {
           *current_pos += offset as u64;
         } else if -offset as u64 > *current_pos {
-          return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "An attempt was made to move the file pointer before the beginning of the file."));
+          return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "An attempt was made to move the file pointer before the beginning of the file.",
+          ));
         } else {
           *current_pos -= -offset as u64;
         }
@@ -1140,6 +1184,22 @@ impl deno_io::fs::File for FileBackedVfsFile {
     Err(FsError::NotSupported)
   }
 
+  fn chown_sync(
+    self: Rc<Self>,
+    _uid: Option<u32>,
+    _gid: Option<u32>,
+  ) -> FsResult<()> {
+    Err(FsError::NotSupported)
+  }
+
+  async fn chown_async(
+    self: Rc<Self>,
+    _uid: Option<u32>,
+    _gid: Option<u32>,
+  ) -> FsResult<()> {
+    Err(FsError::NotSupported)
+  }
+
   fn seek_sync(self: Rc<Self>, pos: SeekFrom) -> FsResult<u64> {
     self.seek(pos).map_err(|err| err.into())
   }
@@ -1209,7 +1269,7 @@ impl deno_io::fs::File for FileBackedVfsFile {
   }
 
   // lower level functionality
-  fn as_stdio(self: Rc<Self>) -> FsResult<std::process::Stdio> {
+  fn as_stdio(self: Rc<Self>) -> FsResult<StdStdio> {
     Err(FsError::NotSupported)
   }
   fn backing_fd(self: Rc<Self>) -> Option<ResourceHandleFd> {
@@ -1255,6 +1315,7 @@ impl FileBackedVfsMetadata {
       },
     }
   }
+
   pub fn as_fs_stat(&self) -> FsStat {
     // to use lower overhead, use mtime instead of all time params
     FsStat {
@@ -1346,16 +1407,23 @@ impl FileBackedVfs {
     )
   }
 
-  pub fn read_dir_with_metadata<'a>(
-    &'a self,
+  pub fn read_dir_with_metadata(
+    &self,
     path: &Path,
-  ) -> std::io::Result<impl Iterator<Item = FileBackedVfsDirEntry> + 'a> {
+  ) -> std::io::Result<impl Iterator<Item = FileBackedVfsDirEntry> + use<>> {
     let dir = self.dir_entry(path)?;
     let path = path.to_path_buf();
-    Ok(dir.entries.iter().map(move |entry| FileBackedVfsDirEntry {
-      parent_path: path.to_path_buf(),
-      metadata: FileBackedVfsMetadata::from_vfs_entry_ref(entry.as_ref()),
-    }))
+    Ok(
+      dir
+        .entries
+        .iter()
+        .map(move |entry| FileBackedVfsDirEntry {
+          parent_path: path.to_path_buf(),
+          metadata: FileBackedVfsMetadata::from_vfs_entry_ref(entry.as_ref()),
+        })
+        .collect::<Vec<_>>()
+        .into_iter(),
+    )
   }
 
   pub fn read_link(&self, path: &Path) -> std::io::Result<PathBuf> {
@@ -1366,10 +1434,9 @@ impl FileBackedVfs {
       VfsEntryRef::Symlink(symlink) => {
         Ok(symlink.resolve_dest_from_root(&self.fs_root.root_path))
       }
-      VfsEntryRef::Dir(_) | VfsEntryRef::File(_) => Err(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        "not a symlink",
-      )),
+      VfsEntryRef::Dir(_) | VfsEntryRef::File(_) => {
+        Err(std::io::Error::other("not a symlink"))
+      }
     }
   }
 
@@ -1445,23 +1512,27 @@ impl FileBackedVfs {
     match entry {
       VfsEntryRef::Dir(dir) => Ok(dir),
       VfsEntryRef::Symlink(_) => unreachable!(),
-      VfsEntryRef::File(_) => Err(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        "path is a file",
-      )),
+      VfsEntryRef::File(_) => Err(std::io::Error::other("path is a file")),
     }
   }
 
   pub fn file_entry(&self, path: &Path) -> std::io::Result<&VirtualFile> {
     let (_, entry) = self.fs_root.find_entry(path, self.case_sensitivity)?;
     match entry {
-      VfsEntryRef::Dir(_) => Err(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        "path is a directory",
-      )),
+      VfsEntryRef::Dir(_) => Err(std::io::Error::other("path is a directory")),
       VfsEntryRef::Symlink(_) => unreachable!(),
       VfsEntryRef::File(file) => Ok(file),
     }
+  }
+}
+
+impl DenoRtNativeAddonLoader for FileBackedVfs {
+  fn load_if_in_vfs(&self, path: &Path) -> Option<Cow<'static, [u8]>> {
+    if !self.is_path_within(path) {
+      return None;
+    }
+    let file = self.file_entry(path).ok()?;
+    self.read_file_offset_with_len(file.offset).ok()
   }
 }
 
@@ -1470,8 +1541,8 @@ mod test {
   use std::io::Write;
 
   use deno_lib::standalone::virtual_fs::VfsBuilder;
-  use test_util::assert_contains;
   use test_util::TempDir;
+  use test_util::assert_contains;
 
   use super::*;
 
@@ -1705,10 +1776,7 @@ mod test {
     file.read_to_buf(&mut buf).unwrap();
     assert_eq!(buf, b"23");
     assert_eq!(
-      file
-        .seek(SeekFrom::Current(-5))
-        .unwrap_err()
-        .to_string(),
+      file.seek(SeekFrom::Current(-5)).unwrap_err().to_string(),
       "An attempt was made to move the file pointer before the beginning of the file."
     );
     // go beyond the file length, then back

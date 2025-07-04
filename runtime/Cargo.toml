@@ -2,7 +2,7 @@
 
 [package]
 name = "deno_runtime"
-version = "0.207.0"
+version = "0.217.0"
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -37,11 +37,6 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 name = "deno_runtime"
 path = "lib.rs"
 
-[[example]]
-name = "extension"
-path = "examples/extension/main.rs"
-required-features = ["transpile"]
-
 [dependencies]
 deno_ast = { workspace = true, optional = true }
 deno_broadcast_channel.workspace = true
@@ -52,6 +47,7 @@ deno_core.workspace = true
 deno_cron.workspace = true
 deno_crypto.workspace = true
 deno_error.workspace = true
+deno_features.workspace = true
 deno_fetch.workspace = true
 deno_ffi.workspace = true
 deno_fs = { workspace = true, features = ["sync_fs"] }

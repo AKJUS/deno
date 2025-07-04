@@ -6,11 +6,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use deno_core::GarbageCollected;
+use deno_core::OpState;
 use deno_core::cppgc::SameObject;
 use deno_core::op2;
 use deno_core::v8;
-use deno_core::GarbageCollected;
-use deno_core::OpState;
 pub use wgpu_core;
 pub use wgpu_types;
 use wgpu_types::PowerPreference;
@@ -64,7 +64,11 @@ pub type Instance = Arc<wgpu_core::global::Global>;
 deno_core::extension!(
   deno_webgpu,
   deps = [deno_webidl, deno_web],
-  ops = [op_create_gpu],
+  ops = [
+    op_create_gpu,
+    device::op_webgpu_device_start_capture,
+    device::op_webgpu_device_stop_capture,
+  ],
   objects = [
     GPU,
     adapter::GPUAdapter,
@@ -123,7 +127,11 @@ struct ErrorEventClass(v8::Global<v8::Value>);
 
 pub struct GPU;
 
-impl GarbageCollected for GPU {}
+impl GarbageCollected for GPU {
+  fn get_name(&self) -> &'static std::ffi::CStr {
+    c"GPU"
+  }
+}
 
 #[op2]
 impl GPU {

@@ -6,23 +6,24 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::rc::Rc;
 
-use deno_core::op2;
-use deno_core::v8;
 use deno_core::GarbageCollected;
 use deno_core::OpState;
 use deno_core::Resource;
+use deno_core::op2;
+use deno_core::v8;
 use deno_error::JsErrorBox;
 use deno_error::JsErrorClass;
+use denort_helper::DenoRtNativeAddonLoaderRc;
 use dlopen2::raw::Library;
 use serde::Deserialize;
 use serde_value::ValueDeserializer;
 
+use crate::FfiPermissions;
 use crate::ir::out_buffer_as_ptr;
 use crate::symbol::NativeType;
 use crate::symbol::Symbol;
 use crate::turbocall;
 use crate::turbocall::Turbocall;
-use crate::FfiPermissions;
 
 deno_error::js_error_wrapper!(dlopen2::Error, JsDlopen2Error, |err| {
   match err {
@@ -49,6 +50,9 @@ pub enum DlfcnError {
   #[class(inherit)]
   #[error(transparent)]
   Permission(#[from] deno_permissions::PermissionCheckError),
+  #[class(inherit)]
+  #[error(transparent)]
+  DenoRtLoad(#[from] denort_helper::LoadError),
   #[class(inherit)]
   #[error(transparent)]
   Other(#[from] JsErrorBox),
@@ -125,13 +129,14 @@ impl<'de> Deserialize<'de> for ForeignSymbol {
     let value = serde_value::Value::deserialize(deserializer)?;
 
     // Probe a ForeignStatic and if that doesn't match, assume ForeignFunction to improve error messages
-    if let Ok(res) = ForeignStatic::deserialize(
-      ValueDeserializer::<D::Error>::new(value.clone()),
-    ) {
-      Ok(ForeignSymbol::ForeignStatic(res))
-    } else {
-      ForeignFunction::deserialize(ValueDeserializer::<D::Error>::new(value))
-        .map(ForeignSymbol::ForeignFunction)
+    match ForeignStatic::deserialize(ValueDeserializer::<D::Error>::new(
+      value.clone(),
+    )) {
+      Ok(res) => Ok(ForeignSymbol::ForeignStatic(res)),
+      _ => {
+        ForeignFunction::deserialize(ValueDeserializer::<D::Error>::new(value))
+          .map(ForeignSymbol::ForeignFunction)
+      }
     }
   }
 }
@@ -151,17 +156,23 @@ pub fn op_ffi_load<'scope, FP>(
 where
   FP: FfiPermissions + 'static,
 {
-  let path = {
+  let (path, denort_helper) = {
     let mut state = state.borrow_mut();
     let permissions = state.borrow_mut::<FP>();
-    permissions.check_partial_with_path(&args.path)?
+    (
+      permissions.check_partial_with_path(&args.path)?,
+      state.try_borrow::<DenoRtNativeAddonLoaderRc>().cloned(),
+    )
   };
 
-  let lib = Library::open(&path).map_err(|e| {
-    dlopen2::Error::OpeningLibraryError(std::io::Error::new(
-      std::io::ErrorKind::Other,
-      format_error(e, &path),
-    ))
+  let real_path = match denort_helper {
+    Some(loader) => loader.load_and_resolve_path(&path)?,
+    None => Cow::Borrowed(path.as_ref()),
+  };
+  let lib = Library::open(real_path.as_ref()).map_err(|e| {
+    dlopen2::Error::OpeningLibraryError(std::io::Error::other(format_error(
+      e, &real_path,
+    )))
   })?;
   let mut resource = DynamicLibraryResource {
     lib,
@@ -251,7 +262,11 @@ struct FunctionData {
   turbocall: Option<Turbocall>,
 }
 
-impl GarbageCollected for FunctionData {}
+impl GarbageCollected for FunctionData {
+  fn get_name(&self) -> &'static std::ffi::CStr {
+    c"FunctionData"
+  }
+}
 
 // Create a JavaScript function for synchronous FFI call to
 // the given symbol.
@@ -347,9 +362,9 @@ pub(crate) fn format_error(
       use winapi::shared::minwindef::DWORD;
       use winapi::shared::winerror::ERROR_INSUFFICIENT_BUFFER;
       use winapi::um::errhandlingapi::GetLastError;
-      use winapi::um::winbase::FormatMessageW;
       use winapi::um::winbase::FORMAT_MESSAGE_ARGUMENT_ARRAY;
       use winapi::um::winbase::FORMAT_MESSAGE_FROM_SYSTEM;
+      use winapi::um::winbase::FormatMessageW;
       use winapi::um::winnt::LANG_SYSTEM_DEFAULT;
       use winapi::um::winnt::MAKELANGID;
       use winapi::um::winnt::SUBLANG_SYS_DEFAULT;

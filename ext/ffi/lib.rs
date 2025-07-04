@@ -14,23 +14,25 @@ mod r#static;
 mod symbol;
 mod turbocall;
 
+pub use call::CallError;
 use call::op_ffi_call_nonblocking;
 use call::op_ffi_call_ptr;
 use call::op_ffi_call_ptr_nonblocking;
-pub use call::CallError;
+pub use callback::CallbackError;
 use callback::op_ffi_unsafe_callback_close;
 use callback::op_ffi_unsafe_callback_create;
 use callback::op_ffi_unsafe_callback_ref;
-pub use callback::CallbackError;
 use deno_permissions::PermissionCheckError;
-use dlfcn::op_ffi_load;
+pub use denort_helper::DenoRtNativeAddonLoader;
+pub use denort_helper::DenoRtNativeAddonLoaderRc;
 pub use dlfcn::DlfcnError;
 use dlfcn::ForeignFunction;
+use dlfcn::op_ffi_load;
 pub use ir::IRError;
-use r#static::op_ffi_get_static;
-pub use r#static::StaticError;
 pub use repr::ReprError;
 use repr::*;
+pub use r#static::StaticError;
+use r#static::op_ffi_get_static;
 use symbol::NativeType;
 use symbol::Symbol;
 
@@ -106,4 +108,12 @@ deno_core::extension!(deno_ffi,
     op_ffi_unsafe_callback_ref,
   ],
   esm = [ "00_ffi.js" ],
+  options = {
+    deno_rt_native_addon_loader: Option<DenoRtNativeAddonLoaderRc>,
+  },
+  state = |state, options| {
+    if let Some(loader) = options.deno_rt_native_addon_loader {
+      state.put(loader);
+    }
+  },
 );

@@ -4,29 +4,48 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use deno_core::LocalInspectorSession;
 use deno_core::error::CoreError;
 use deno_core::futures::StreamExt;
 use deno_core::serde_json::json;
 use deno_core::serde_json::{self};
 use deno_core::url::Url;
-use deno_core::LocalInspectorSession;
 use deno_error::JsErrorBox;
 use deno_terminal::colors;
 use tokio::select;
 
 use crate::cdp;
-use crate::emit::Emitter;
+use crate::module_loader::CliEmitter;
 use crate::util::file_watcher::WatcherCommunicator;
 use crate::util::file_watcher::WatcherRestartMode;
 
-fn explain(status: &cdp::Status) -> &'static str {
-  match status {
-    cdp::Status::Ok => "OK",
-    cdp::Status::CompileError => "compile error",
-    cdp::Status::BlockedByActiveGenerator => "blocked by active generator",
-    cdp::Status::BlockedByActiveFunction => "blocked by active function",
+fn explain(response: &cdp::SetScriptSourceResponse) -> String {
+  match response.status {
+    cdp::Status::Ok => "OK".to_string(),
+    cdp::Status::CompileError => {
+      if let Some(details) = &response.exception_details {
+        let (message, description) = details.get_message_and_description();
+        format!(
+          "compile error: {}{}",
+          message,
+          if description == "undefined" {
+            "".to_string()
+          } else {
+            format!(" - {}", description)
+          }
+        )
+      } else {
+        "compile error: No exception details available".to_string()
+      }
+    }
+    cdp::Status::BlockedByActiveGenerator => {
+      "blocked by active generator".to_string()
+    }
+    cdp::Status::BlockedByActiveFunction => {
+      "blocked by active function".to_string()
+    }
     cdp::Status::BlockedByTopLevelEsModuleChange => {
-      "blocked by top-level ES module change"
+      "blocked by top-level ES module change".to_string()
     }
   }
 }
@@ -60,7 +79,7 @@ pub struct HmrRunner {
   session: LocalInspectorSession,
   watcher_communicator: Arc<WatcherCommunicator>,
   script_ids: HashMap<String, String>,
-  emitter: Arc<Emitter>,
+  emitter: Arc<CliEmitter>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -140,9 +159,11 @@ impl crate::worker::HmrRunner for HmrRunner {
               continue;
             };
 
-            let source_code = self.emitter.load_and_emit_for_hmr(
+            let source_code = tokio::fs::read_to_string(deno_path_util::url_to_file_path(&module_url).unwrap()).await?;
+            let source_code = self.emitter.emit_for_hmr(
               &module_url,
-            ).await?;
+              source_code,
+            )?;
 
             let mut tries = 1;
             loop {
@@ -154,7 +175,7 @@ impl crate::worker::HmrRunner for HmrRunner {
                 break;
               }
 
-              self.watcher_communicator.print(format!("Failed to reload module {}: {}.", module_url, colors::gray(explain(&result.status))));
+              self.watcher_communicator.print(format!("Failed to reload module {}: {}.", module_url, colors::gray(&explain(&result))));
               if should_retry(&result.status) && tries <= 2 {
                 tries += 1;
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -174,7 +195,7 @@ impl crate::worker::HmrRunner for HmrRunner {
 
 impl HmrRunner {
   pub fn new(
-    emitter: Arc<Emitter>,
+    emitter: Arc<CliEmitter>,
     session: LocalInspectorSession,
     watcher_communicator: Arc<WatcherCommunicator>,
   ) -> Self {

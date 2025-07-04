@@ -9,24 +9,24 @@ use std::sync::Arc;
 
 use deno_ast::MediaType;
 use deno_ast::ModuleSpecifier;
+use deno_core::anyhow::Context;
 use deno_core::anyhow::anyhow;
 use deno_core::anyhow::bail;
-use deno_core::anyhow::Context;
 use deno_core::error::AnyError;
 use deno_core::resolve_url_or_path;
 use deno_graph::GraphKind;
+use deno_npm_installer::graph::NpmCachingStrategy;
 use deno_path_util::url_from_file_path;
 use deno_path_util::url_to_file_path;
 use deno_terminal::colors;
 use rand::Rng;
 
-use super::installer::infer_name_from_url;
+use super::installer::BinNameResolver;
 use crate::args::CompileFlags;
 use crate::args::Flags;
 use crate::factory::CliFactory;
-use crate::http_util::HttpClientProvider;
-use crate::standalone::binary::is_standalone_binary;
 use crate::standalone::binary::WriteBinOptions;
+use crate::standalone::binary::is_standalone_binary;
 
 pub async fn compile(
   flags: Arc<Flags>,
@@ -36,10 +36,10 @@ pub async fn compile(
   let cli_options = factory.cli_options()?;
   let module_graph_creator = factory.module_graph_creator().await?;
   let binary_writer = factory.create_compile_binary_writer().await?;
-  let http_client = factory.http_client_provider();
   let entrypoint = cli_options.resolve_main_module()?;
+  let bin_name_resolver = factory.bin_name_resolver()?;
   let output_path = resolve_compile_executable_output_path(
-    http_client,
+    &bin_name_resolver,
     &compile_flags,
     cli_options.initial_cwd(),
   )
@@ -64,7 +64,7 @@ pub async fn compile(
       .create_graph(
         GraphKind::CodeOnly,
         module_roots,
-        crate::graph_util::NpmCachingStrategy::Eager,
+        NpmCachingStrategy::Eager,
       )
       .await?
   } else {
@@ -83,7 +83,7 @@ pub async fn compile(
   temp_filename.push(format!(
     ".tmp-{}",
     faster_hex::hex_encode(
-      &rand::thread_rng().gen::<[u8; 8]>(),
+      &rand::thread_rng().r#gen::<[u8; 8]>(),
       &mut [0u8; 16]
     )
     .unwrap()
@@ -104,10 +104,15 @@ pub async fn compile(
       graph: &graph,
       entrypoint,
       include_paths: &include_paths,
-      exclude_paths: vec![
-        cli_options.initial_cwd().join(&output_path),
-        cli_options.initial_cwd().join(&temp_path),
-      ],
+      exclude_paths: compile_flags
+        .exclude
+        .iter()
+        .map(|p| cli_options.initial_cwd().join(p))
+        .chain(std::iter::once(
+          cli_options.initial_cwd().join(&output_path),
+        ))
+        .chain(std::iter::once(cli_options.initial_cwd().join(&temp_path)))
+        .collect(),
       compile_flags: &compile_flags,
     })
     .await
@@ -157,12 +162,12 @@ pub async fn compile_eszip(
   let factory = CliFactory::from_flags(flags);
   let cli_options = factory.cli_options()?;
   let module_graph_creator = factory.module_graph_creator().await?;
-  let parsed_source_cache = factory.parsed_source_cache();
-  let tsconfig_resolver = factory.tsconfig_resolver()?;
-  let http_client = factory.http_client_provider();
+  let parsed_source_cache = factory.parsed_source_cache()?;
+  let compiler_options_resolver = factory.compiler_options_resolver()?;
+  let bin_name_resolver = factory.bin_name_resolver()?;
   let entrypoint = cli_options.resolve_main_module()?;
   let mut output_path = resolve_compile_executable_output_path(
-    http_client,
+    &bin_name_resolver,
     &compile_flags,
     cli_options.initial_cwd(),
   )
@@ -191,15 +196,16 @@ pub async fn compile_eszip(
       .create_graph(
         GraphKind::CodeOnly,
         module_roots,
-        crate::graph_util::NpmCachingStrategy::Eager,
+        NpmCachingStrategy::Eager,
       )
       .await?
   } else {
     graph
   };
 
-  let transpile_and_emit_options = tsconfig_resolver
-    .transpile_and_emit_options(cli_options.workspace().root_dir())?;
+  let transpile_and_emit_options = compiler_options_resolver
+    .for_specifier(cli_options.workspace().root_dir())
+    .transpile_options()?;
   let transpile_options = transpile_and_emit_options.transpile.clone();
   let emit_options = transpile_and_emit_options.emit.clone();
 
@@ -301,13 +307,13 @@ fn validate_output_path(output_path: &Path) -> Result<(), AnyError> {
     let output_base = &output_path.parent().unwrap();
     if output_base.exists() && output_base.is_file() {
       bail!(
-          concat!(
-            "Could not compile to file '{}' because its parent directory ",
-            "is an existing file. You can use the `--output <file-path>` flag to ",
-            "provide an alternative name.",
-          ),
-          output_base.display(),
-        );
+        concat!(
+          "Could not compile to file '{}' because its parent directory ",
+          "is an existing file. You can use the `--output <file-path>` flag to ",
+          "provide an alternative name.",
+        ),
+        output_base.display(),
+      );
     }
     std::fs::create_dir_all(output_base)?;
   }
@@ -324,7 +330,10 @@ fn get_module_roots_and_include_paths(
     if url.scheme() != "file" {
       return true;
     }
-    let media_type = MediaType::from_specifier(url);
+    is_module_graph_media_type(MediaType::from_specifier(url))
+  }
+
+  fn is_module_graph_media_type(media_type: MediaType) -> bool {
     match media_type {
       MediaType::JavaScript
       | MediaType::Jsx
@@ -349,8 +358,9 @@ fn get_module_roots_and_include_paths(
 
   fn analyze_path(
     url: &ModuleSpecifier,
+    excluded_paths: &HashSet<PathBuf>,
     searched_paths: &mut HashSet<PathBuf>,
-    mut add_url: impl FnMut(ModuleSpecifier),
+    mut add_path: impl FnMut(&Path),
   ) -> Result<(), AnyError> {
     let Ok(path) = url_to_file_path(url) else {
       return Ok(());
@@ -360,9 +370,11 @@ fn get_module_roots_and_include_paths(
       if !searched_paths.insert(path.clone()) {
         continue;
       }
+      if excluded_paths.contains(&path) {
+        continue;
+      }
       if !path.is_dir() {
-        let url = url_from_file_path(&path)?;
-        add_url(url);
+        add_path(&path);
         continue;
       }
       for entry in std::fs::read_dir(&path).with_context(|| {
@@ -380,15 +392,23 @@ fn get_module_roots_and_include_paths(
   let mut searched_paths = HashSet::new();
   let mut module_roots = Vec::new();
   let mut include_paths = Vec::new();
+  let exclude_set = compile_flags
+    .exclude
+    .iter()
+    .map(|path| initial_cwd.join(path))
+    .collect::<HashSet<_>>();
   module_roots.push(entrypoint.clone());
   for side_module in &compile_flags.include {
     let url = resolve_url_or_path(side_module, initial_cwd)?;
     if is_module_graph_module(&url) {
       module_roots.push(url.clone());
     } else {
-      analyze_path(&url, &mut searched_paths, |file_url| {
-        if is_module_graph_module(&file_url) {
-          module_roots.push(file_url);
+      analyze_path(&url, &exclude_set, &mut searched_paths, |file_path| {
+        let media_type = MediaType::from_path(file_path);
+        if is_module_graph_media_type(media_type) {
+          if let Ok(file_url) = url_from_file_path(file_path) {
+            module_roots.push(file_url);
+          }
         }
       })?;
     }
@@ -400,7 +420,7 @@ fn get_module_roots_and_include_paths(
 }
 
 async fn resolve_compile_executable_output_path(
-  http_client_provider: &HttpClientProvider,
+  bin_name_resolver: &BinNameResolver<'_>,
   compile_flags: &CompileFlags,
   current_dir: &Path,
 ) -> Result<PathBuf, AnyError> {
@@ -411,10 +431,10 @@ async fn resolve_compile_executable_output_path(
   let mut output_path = if let Some(out) = output_flag.as_ref() {
     let mut out_path = PathBuf::from(out);
     if out.ends_with('/') || out.ends_with('\\') {
-      if let Some(infer_file_name) =
-        infer_name_from_url(http_client_provider, &module_specifier)
-          .await
-          .map(PathBuf::from)
+      if let Some(infer_file_name) = bin_name_resolver
+        .infer_name_from_url(&module_specifier)
+        .await
+        .map(PathBuf::from)
       {
         out_path = out_path.join(infer_file_name);
       }
@@ -427,7 +447,8 @@ async fn resolve_compile_executable_output_path(
   };
 
   if output_flag.is_none() {
-    output_path = infer_name_from_url(http_client_provider, &module_specifier)
+    output_path = bin_name_resolver
+      .infer_name_from_url(&module_specifier)
       .await
       .map(PathBuf::from)
   }
@@ -461,13 +482,18 @@ fn get_os_specific_filepath(
 
 #[cfg(test)]
 mod test {
+  use deno_npm::registry::TestNpmRegistryApi;
+
   pub use super::*;
+  use crate::http_util::HttpClientProvider;
 
   #[tokio::test]
   async fn resolve_compile_executable_output_path_target_linux() {
     let http_client = HttpClientProvider::new(None, None);
+    let npm_api = TestNpmRegistryApi::default();
+    let bin_name_resolver = BinNameResolver::new(&http_client, &npm_api);
     let path = resolve_compile_executable_output_path(
-      &http_client,
+      &bin_name_resolver,
       &CompileFlags {
         source_file: "mod.ts".to_string(),
         output: Some(String::from("./file")),
@@ -475,7 +501,8 @@ mod test {
         target: Some("x86_64-unknown-linux-gnu".to_string()),
         no_terminal: false,
         icon: None,
-        include: vec![],
+        include: Default::default(),
+        exclude: Default::default(),
         eszip: true,
       },
       &std::env::current_dir().unwrap(),
@@ -492,14 +519,17 @@ mod test {
   #[tokio::test]
   async fn resolve_compile_executable_output_path_target_windows() {
     let http_client = HttpClientProvider::new(None, None);
+    let npm_api = TestNpmRegistryApi::default();
+    let bin_name_resolver = BinNameResolver::new(&http_client, &npm_api);
     let path = resolve_compile_executable_output_path(
-      &http_client,
+      &bin_name_resolver,
       &CompileFlags {
         source_file: "mod.ts".to_string(),
         output: Some(String::from("./file")),
         args: Vec::new(),
         target: Some("x86_64-pc-windows-msvc".to_string()),
-        include: vec![],
+        include: Default::default(),
+        exclude: Default::default(),
         icon: None,
         no_terminal: false,
         eszip: true,

@@ -12,9 +12,6 @@ use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use deno_core::futures::TryFutureExt;
-use deno_core::op2;
-use deno_core::v8;
 use deno_core::AsyncRefCell;
 use deno_core::AsyncResult;
 use deno_core::CancelHandle;
@@ -23,20 +20,23 @@ use deno_core::OpState;
 use deno_core::RcRef;
 use deno_core::Resource;
 use deno_core::ResourceId;
+use deno_core::futures::TryFutureExt;
+use deno_core::op2;
+use deno_core::v8;
 use deno_error::JsErrorBox;
-use deno_tls::create_client_config;
-use deno_tls::load_certs;
-use deno_tls::load_private_keys;
-use deno_tls::new_resolver;
-use deno_tls::rustls::pki_types::ServerName;
-use deno_tls::rustls::ClientConnection;
-use deno_tls::rustls::ServerConfig;
 use deno_tls::ServerConfigProvider;
 use deno_tls::SocketUse;
 use deno_tls::TlsKey;
 use deno_tls::TlsKeyLookup;
 use deno_tls::TlsKeys;
 use deno_tls::TlsKeysHolder;
+use deno_tls::create_client_config;
+use deno_tls::load_certs;
+use deno_tls::load_private_keys;
+use deno_tls::new_resolver;
+use deno_tls::rustls::ClientConnection;
+use deno_tls::rustls::ServerConfig;
+use deno_tls::rustls::pki_types::ServerName;
 pub use rustls_tokio_stream::TlsStream;
 use rustls_tokio_stream::TlsStreamRead;
 use rustls_tokio_stream::TlsStreamWrite;
@@ -45,6 +45,9 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
+use crate::DefaultTlsOptions;
+use crate::NetPermissions;
+use crate::UnsafelyIgnoreCertificateErrors;
 use crate::io::TcpStreamResource;
 use crate::ops::IpAddr;
 use crate::ops::NetError;
@@ -53,9 +56,6 @@ use crate::raw::NetworkListenerResource;
 use crate::resolve_addr::resolve_addr;
 use crate::resolve_addr::resolve_addr_sync;
 use crate::tcp::TcpListener;
-use crate::DefaultTlsOptions;
-use crate::NetPermissions;
-use crate::UnsafelyIgnoreCertificateErrors;
 
 pub(crate) const TLS_BUFFER_SIZE: Option<NonZeroUsize> =
   NonZeroUsize::new(65536);
@@ -188,6 +188,7 @@ pub struct StartTlsArgs {
   ca_certs: Vec<String>,
   hostname: String,
   alpn_protocols: Option<Vec<String>>,
+  reject_unauthorized: Option<bool>,
 }
 
 #[op2]
@@ -196,7 +197,7 @@ pub fn op_tls_key_null() -> TlsKeysHolder {
   TlsKeysHolder::from(TlsKeys::Null)
 }
 
-#[op2]
+#[op2(reentrant)]
 #[cppgc]
 pub fn op_tls_key_static(
   #[string] cert: &str,
@@ -258,11 +259,13 @@ pub fn op_tls_cert_resolver_resolve_error(
 pub fn op_tls_start<NP>(
   state: Rc<RefCell<OpState>>,
   #[serde] args: StartTlsArgs,
+  #[cppgc] key_pair: Option<&TlsKeysHolder>,
 ) -> Result<(ResourceId, IpAddr, IpAddr), NetError>
 where
   NP: NetPermissions + 'static,
 {
   let rid = args.rid;
+  let reject_unauthorized = args.reject_unauthorized.unwrap_or(true);
   let hostname = match &*args.hostname {
     "" => "localhost".to_string(),
     n => n.to_string(),
@@ -277,10 +280,15 @@ where
   let hostname_dns = ServerName::try_from(hostname.to_string())
     .map_err(|_| NetError::InvalidHostname(hostname))?;
 
-  let unsafely_ignore_certificate_errors = state
-    .borrow()
-    .try_borrow::<UnsafelyIgnoreCertificateErrors>()
-    .and_then(|it| it.0.clone());
+  // --unsafely-ignore-certificate-errors overrides the `rejectUnauthorized` option.
+  let unsafely_ignore_certificate_errors = if reject_unauthorized {
+    state
+      .borrow()
+      .try_borrow::<UnsafelyIgnoreCertificateErrors>()
+      .and_then(|it| it.0.clone())
+  } else {
+    Some(Vec::new())
+  };
 
   let root_cert_store = state
     .borrow()
@@ -304,11 +312,13 @@ where
   let local_addr = tcp_stream.local_addr()?;
   let remote_addr = tcp_stream.peer_addr()?;
 
+  let tls_null = TlsKeysHolder::from(TlsKeys::Null);
+  let key_pair = key_pair.unwrap_or(&tls_null);
   let mut tls_config = create_client_config(
     root_cert_store,
     ca_certs,
     unsafely_ignore_certificate_errors,
-    TlsKeys::Null,
+    key_pair.take(),
     SocketUse::GeneralSsl,
   )?;
 

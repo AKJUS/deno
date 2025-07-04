@@ -12,10 +12,11 @@ use std::future::poll_fn;
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
@@ -24,15 +25,18 @@ use deno_ast::MediaType;
 use deno_cache_dir::file_fetcher::File;
 use deno_config::glob::FilePatterns;
 use deno_config::glob::WalkEntry;
+use deno_core::ModuleSpecifier;
+use deno_core::OpState;
+use deno_core::PollEventLoopOptions;
 use deno_core::anyhow;
 use deno_core::anyhow::anyhow;
 use deno_core::error::AnyError;
 use deno_core::error::CoreError;
 use deno_core::error::JsError;
-use deno_core::futures::future;
-use deno_core::futures::stream;
 use deno_core::futures::FutureExt;
 use deno_core::futures::StreamExt;
+use deno_core::futures::future;
+use deno_core::futures::stream;
 use deno_core::located_script_name;
 use deno_core::serde_v8;
 use deno_core::stats::RuntimeActivity;
@@ -45,10 +49,9 @@ use deno_core::unsync::spawn;
 use deno_core::unsync::spawn_blocking;
 use deno_core::url::Url;
 use deno_core::v8;
-use deno_core::ModuleSpecifier;
-use deno_core::OpState;
-use deno_core::PollEventLoopOptions;
 use deno_error::JsErrorBox;
+use deno_npm_installer::graph::NpmCachingStrategy;
+use deno_runtime::WorkerExecutionMode;
 use deno_runtime::deno_io::Stdio;
 use deno_runtime::deno_io::StdioPipe;
 use deno_runtime::deno_permissions::Permissions;
@@ -57,13 +60,12 @@ use deno_runtime::fmt_errors::format_js_error;
 use deno_runtime::permissions::RuntimePermissionDescriptorParser;
 use deno_runtime::tokio_util::create_and_run_current_thread;
 use deno_runtime::worker::MainWorker;
-use deno_runtime::WorkerExecutionMode;
 use indexmap::IndexMap;
 use indexmap::IndexSet;
 use log::Level;
+use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use rand::seq::SliceRandom;
-use rand::SeedableRng;
 use regex::Regex;
 use serde::Deserialize;
 use tokio::signal;
@@ -95,11 +97,11 @@ mod channel;
 pub mod fmt;
 pub mod reporters;
 
-pub use channel::create_single_test_event_channel;
-pub use channel::create_test_event_channel;
 pub use channel::TestEventReceiver;
 pub use channel::TestEventSender;
 pub use channel::TestEventWorkerSender;
+pub use channel::create_single_test_event_channel;
+pub use channel::create_test_event_channel;
 use fmt::format_sanitizer_diff;
 pub use fmt::format_test_error;
 use reporters::CompoundTestReporter;
@@ -109,6 +111,8 @@ use reporters::PrettyTestReporter;
 use reporters::TapTestReporter;
 use reporters::TestReporter;
 
+use crate::tools::coverage::cover_files;
+use crate::tools::coverage::reporter;
 use crate::tools::test::channel::ChannelClosedError;
 
 /// How many times we're allowed to spin the event loop before considering something a leak.
@@ -339,12 +343,12 @@ impl TestFailure {
       TestFailure::FailedSteps(n) => {
         Cow::Owned(format!("{} test steps failed.", n))
       }
-      TestFailure::IncompleteSteps => {
-        Cow::Borrowed("Completed while steps were still running. Ensure all steps are awaited with `await t.step(...)`.")
-      }
-      TestFailure::Incomplete => {
-        Cow::Borrowed("Didn't complete before parent. Await step with `await t.step(...)`.")
-      }
+      TestFailure::IncompleteSteps => Cow::Borrowed(
+        "Completed while steps were still running. Ensure all steps are awaited with `await t.step(...)`.",
+      ),
+      TestFailure::Incomplete => Cow::Borrowed(
+        "Didn't complete before parent. Await step with `await t.step(...)`.",
+      ),
       TestFailure::Leaked(details, trailer_notes) => {
         let mut f = String::new();
         write!(f, "Leaks detected:").ok();
@@ -393,6 +397,38 @@ impl TestFailure {
         "Started test step with sanitizers while another test step was running"
           .to_string()
       }
+    }
+  }
+
+  pub fn error_location(&self) -> Option<TestLocation> {
+    const TEST_RUNNER: &str = "ext:cli/40_test.js";
+    match self {
+      TestFailure::JsError(js_error) => js_error
+        .frames
+        .iter()
+        // The first line of user code comes above the test file.
+        // The call stack usually contains the top 10 frames, and cuts off after that.
+        // We need to explicitly check for the test runner here.
+        // - Checking for a `ext:` is not enough, since other Deno `ext:`s can appear in the call stack.
+        // - This check guarantees that the next frame is inside of the Deno.test(),
+        //   and not somewhere else.
+        .position(|v| v.file_name.as_deref() == Some(TEST_RUNNER))
+        // Go one up in the stack frame, this is where the user code was
+        .and_then(|index| index.checked_sub(1))
+        .and_then(|index| {
+          let user_frame = &js_error.frames[index];
+          let file_name = user_frame.file_name.as_ref()?.to_string();
+          // Turn into zero based indices
+          let line_number = user_frame.line_number.map(|v| v - 1)? as u32;
+          let column_number =
+            user_frame.column_number.map(|v| v - 1).unwrap_or(0) as u32;
+          Some(TestLocation {
+            file_name,
+            line_number,
+            column_number,
+          })
+        }),
+      _ => None,
     }
   }
 
@@ -614,10 +650,11 @@ fn get_test_reporter(options: &TestSpecifiersOptions) -> Box<dyn TestReporter> {
 async fn configure_main_worker(
   worker_factory: Arc<CliMainWorkerFactory>,
   specifier: &Url,
+  preload_modules: Vec<Url>,
   permissions_container: PermissionsContainer,
   worker_sender: TestEventWorkerSender,
   options: &TestSpecifierOptions,
-  sender: UnboundedSender<jupyter_runtime::messaging::content::StreamContent>,
+  sender: UnboundedSender<jupyter_protocol::messaging::StreamContent>,
 ) -> Result<
   (Option<Box<dyn CoverageCollector>>, MainWorker),
   CreateCustomWorkerError,
@@ -626,17 +663,19 @@ async fn configure_main_worker(
     .create_custom_worker(
       WorkerExecutionMode::Test,
       specifier.clone(),
+      preload_modules,
       permissions_container,
       vec![
-        ops::testing::deno_test::init_ops(worker_sender.sender),
-        ops::lint::deno_lint_ext_for_test::init_ops(),
-        ops::jupyter::deno_jupyter_for_test::init_ops(sender),
+        ops::testing::deno_test::init(worker_sender.sender),
+        ops::lint::deno_lint_ext_for_test::init(),
+        ops::jupyter::deno_jupyter_for_test::init(sender),
       ],
       Stdio {
         stdin: StdioPipe::inherit(),
         stdout: StdioPipe::file(worker_sender.stdout),
         stderr: StdioPipe::file(worker_sender.stderr),
       },
+      None,
     )
     .await?;
   let coverage_collector = worker.maybe_setup_coverage_collector().await?;
@@ -646,20 +685,24 @@ async fn configure_main_worker(
       "Deno[Deno.internal].core.setLeakTracingEnabled(true);",
     )?;
   }
-  let res = worker.execute_side_module().await;
-  let worker = worker.into_main_worker();
-  match res {
+
+  let op_state = worker.op_state();
+
+  let check_res = |res| match res {
     Ok(()) => Ok(()),
-    Err(CoreError::Js(err)) => {
-      send_test_event(
-        &worker.js_runtime.op_state(),
-        TestEvent::UncaughtError(specifier.to_string(), Box::new(err)),
-      )
-      .map_err(|e| CoreError::JsBox(JsErrorBox::from_err(e)))?;
-      Ok(())
-    }
+    Err(CoreError::Js(err)) => send_test_event(
+      &op_state,
+      TestEvent::UncaughtError(specifier.to_string(), Box::new(err)),
+    )
+    .map_err(|e| CoreError::JsBox(JsErrorBox::from_err(e))),
     Err(err) => Err(err),
-  }?;
+  };
+
+  check_res(worker.execute_preload_modules().await)?;
+  check_res(worker.execute_side_module().await)?;
+
+  let worker = worker.into_main_worker();
+
   Ok((coverage_collector, worker))
 }
 
@@ -669,6 +712,7 @@ pub async fn test_specifier(
   worker_factory: Arc<CliMainWorkerFactory>,
   permissions_container: PermissionsContainer,
   specifier: ModuleSpecifier,
+  preload_modules: Vec<ModuleSpecifier>,
   worker_sender: TestEventWorkerSender,
   fail_fast_tracker: FailFastTracker,
   options: TestSpecifierOptions,
@@ -680,6 +724,7 @@ pub async fn test_specifier(
   let (coverage_collector, mut worker) = configure_main_worker(
     worker_factory,
     &specifier,
+    preload_modules,
     permissions_container,
     worker_sender,
     &options,
@@ -1217,6 +1262,7 @@ async fn test_specifiers(
   permissions: &Permissions,
   permission_desc_parser: &Arc<RuntimePermissionDescriptorParser<CliSys>>,
   specifiers: Vec<ModuleSpecifier>,
+  preload_modules: Vec<ModuleSpecifier>,
   options: TestSpecifiersOptions,
 ) -> Result<(), AnyError> {
   let specifiers = if let Some(seed) = options.specifier.shuffle {
@@ -1247,6 +1293,7 @@ async fn test_specifiers(
       permission_desc_parser.clone(),
       permissions.clone(),
     );
+    let preload_modules = preload_modules.clone();
     let worker_sender = test_event_sender_factory.worker();
     let fail_fast_tracker = fail_fast_tracker.clone();
     let specifier_options = options.specifier.clone();
@@ -1255,6 +1302,7 @@ async fn test_specifiers(
         worker_factory,
         permissions_container,
         specifier,
+        preload_modules,
         worker_sender,
         fail_fast_tracker,
         specifier_options,
@@ -1562,7 +1610,7 @@ pub async fn run_tests(
   flags: Arc<Flags>,
   test_flags: TestFlags,
 ) -> Result<(), AnyError> {
-  let factory = CliFactory::from_flags(flags);
+  let factory = CliFactory::from_flags(flags.clone());
   let cli_options = factory.cli_options()?;
   let workspace_test_options =
     cli_options.resolve_workspace_test_options(&test_flags);
@@ -1618,6 +1666,7 @@ pub async fn run_tests(
 
   let worker_factory =
     Arc::new(factory.create_cli_main_worker_factory().await?);
+  let preload_modules = cli_options.preload_modules()?;
 
   // Run tests
   test_specifiers(
@@ -1625,6 +1674,7 @@ pub async fn run_tests(
     &permissions,
     permission_desc_parser,
     specifiers_for_typecheck_and_test,
+    preload_modules,
     TestSpecifiersOptions {
       cwd: Url::from_directory_path(cli_options.initial_cwd()).map_err(
         |_| {
@@ -1649,6 +1699,34 @@ pub async fn run_tests(
     },
   )
   .await?;
+
+  if test_flags.coverage_raw_data_only {
+    return Ok(());
+  }
+
+  if let Some(ref coverage) = test_flags.coverage_dir {
+    let reporters: [&dyn reporter::CoverageReporter; 3] = [
+      &reporter::SummaryCoverageReporter::new(),
+      &reporter::LcovCoverageReporter::new(),
+      &reporter::HtmlCoverageReporter::new(),
+    ];
+    if let Err(err) = cover_files(
+      flags,
+      vec![coverage.clone()],
+      vec![],
+      vec![],
+      vec![],
+      Some(
+        PathBuf::from(coverage)
+          .join("lcov.info")
+          .to_string_lossy()
+          .to_string(),
+      ),
+      &reporters,
+    ) {
+      log::info!("Error generating coverage report: {}", err);
+    }
+  }
 
   Ok(())
 }
@@ -1738,11 +1816,7 @@ pub async fn run_tests_with_watch(
           &cli_options.permissions_options(),
         )?;
         let graph = module_graph_creator
-          .create_graph(
-            graph_kind,
-            test_modules,
-            crate::graph_util::NpmCachingStrategy::Eager,
-          )
+          .create_graph(graph_kind, test_modules, NpmCachingStrategy::Eager)
           .await?;
         module_graph_creator.graph_valid(&graph)?;
         let test_modules = &graph.roots;
@@ -1804,12 +1878,14 @@ pub async fn run_tests_with_watch(
 
         let worker_factory =
           Arc::new(factory.create_cli_main_worker_factory().await?);
+        let preload_modules = cli_options.preload_modules()?;
 
         test_specifiers(
           worker_factory,
           &permissions,
           permission_desc_parser,
           specifiers_for_typecheck_and_test,
+          preload_modules,
           TestSpecifiersOptions {
             cwd: Url::from_directory_path(cli_options.initial_cwd()).map_err(
               |_| {

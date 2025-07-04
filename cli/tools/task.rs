@@ -15,15 +15,16 @@ use deno_config::workspace::TaskOrScript;
 use deno_config::workspace::WorkspaceDirectory;
 use deno_config::workspace::WorkspaceMemberTasksConfig;
 use deno_config::workspace::WorkspaceTasksConfig;
+use deno_core::anyhow::Context;
 use deno_core::anyhow::anyhow;
 use deno_core::anyhow::bail;
-use deno_core::anyhow::Context;
 use deno_core::error::AnyError;
-use deno_core::futures::future::LocalBoxFuture;
-use deno_core::futures::stream::futures_unordered;
 use deno_core::futures::FutureExt;
 use deno_core::futures::StreamExt;
+use deno_core::futures::future::LocalBoxFuture;
+use deno_core::futures::stream::futures_unordered;
 use deno_core::url::Url;
+use deno_npm_installer::PackageCaching;
 use deno_path_util::normalize_path;
 use deno_task_shell::KillSignal;
 use deno_task_shell::ShellCommand;
@@ -38,8 +39,7 @@ use crate::args::TaskFlags;
 use crate::colors;
 use crate::factory::CliFactory;
 use crate::node::CliNodeResolver;
-use crate::npm::installer::NpmInstaller;
-use crate::npm::installer::PackageCaching;
+use crate::npm::CliNpmInstaller;
 use crate::npm::CliNpmResolver;
 use crate::task_runner;
 use crate::task_runner::run_future_forwarding_signals;
@@ -59,15 +59,21 @@ pub async fn execute_script(
   let cli_options = factory.cli_options()?;
   let start_dir = &cli_options.start_dir;
   if !start_dir.has_deno_or_pkg_json() && !task_flags.eval {
-    bail!("deno task couldn't find deno.json(c). See https://docs.deno.com/go/config")
+    bail!(
+      "deno task couldn't find deno.json(c). See https://docs.deno.com/go/config"
+    )
   }
   let force_use_pkg_json =
     std::env::var_os(crate::task_runner::USE_PKG_JSON_HIDDEN_ENV_VAR_NAME)
       .map(|v| {
         // always remove so sub processes don't inherit this env var
-        std::env::remove_var(
-          crate::task_runner::USE_PKG_JSON_HIDDEN_ENV_VAR_NAME,
-        );
+
+        #[allow(clippy::undocumented_unsafe_blocks)]
+        unsafe {
+          std::env::remove_var(
+            crate::task_runner::USE_PKG_JSON_HIDDEN_ENV_VAR_NAME,
+          )
+        };
         v == "1"
       })
       .unwrap_or(false);
@@ -231,7 +237,7 @@ struct RunSingleOptions<'a> {
 
 struct TaskRunner<'a> {
   task_flags: &'a TaskFlags,
-  npm_installer: Option<&'a NpmInstaller>,
+  npm_installer: Option<&'a CliNpmInstaller>,
   npm_resolver: &'a CliNpmResolver,
   node_resolver: &'a CliNodeResolver,
   env_vars: HashMap<OsString, OsString>,
@@ -384,10 +390,13 @@ impl<'a> TaskRunner<'a> {
 
     while context.has_remaining_tasks() {
       while queue.len() < self.concurrency {
-        if let Some(task) = context.get_next_task(self, kill_signal, args) {
-          queue.push(task);
-        } else {
-          break;
+        match context.get_next_task(self, kill_signal, args) {
+          Some(task) => {
+            queue.push(task);
+          }
+          _ => {
+            break;
+          }
         }
       }
 
@@ -748,7 +757,10 @@ fn print_available_tasks_workspace(
   if !matched {
     log::warn!(
       "{}",
-      colors::red(format!("No package name matched the filter '{}' in available 'deno.json' or 'package.json' files.", filter))
+      colors::red(format!(
+        "No package name matched the filter '{}' in available 'deno.json' or 'package.json' files.",
+        filter
+      ))
     );
   }
 
@@ -929,12 +941,7 @@ fn match_tasks(
 
   // Match tasks in deno.json
   for name in tasks_config.task_names() {
-    let matches_filter = match &task_name_filter {
-      TaskNameFilter::Exact(n) => *n == name,
-      TaskNameFilter::Regex(re) => re.is_match(name),
-    };
-
-    if matches_filter && !visited.contains(name) {
+    if task_name_filter.matches(name) && !visited.contains(name) {
       matched.insert(name.to_string());
       visit_task_and_dependencies(tasks_config, &mut visited, name);
     }
@@ -957,6 +964,7 @@ fn arg_to_task_name_filter(input: &str) -> Result<TaskNameFilter, AnyError> {
 
   let mut regex_str = regex::escape(input);
   regex_str = regex_str.replace("\\*", ".*");
+  regex_str = format!("^{}", regex_str);
   let re = Regex::new(&regex_str)?;
   Ok(TaskNameFilter::Regex(re))
 }
@@ -965,6 +973,15 @@ fn arg_to_task_name_filter(input: &str) -> Result<TaskNameFilter, AnyError> {
 enum TaskNameFilter<'s> {
   Exact(&'s str),
   Regex(regex::Regex),
+}
+
+impl TaskNameFilter<'_> {
+  fn matches(&self, name: &str) -> bool {
+    match self {
+      Self::Exact(n) => *n == name,
+      Self::Regex(re) => re.is_match(name),
+    }
+  }
 }
 
 #[cfg(test)]
@@ -985,5 +1002,10 @@ mod tests {
       arg_to_task_name_filter("test*").unwrap(),
       TaskNameFilter::Regex(_)
     ));
+
+    let filter = arg_to_task_name_filter("test:*").unwrap();
+    assert!(filter.matches("test:deno"));
+    assert!(filter.matches("test:dprint"));
+    assert!(!filter.matches("update:latest:deno"));
   }
 }

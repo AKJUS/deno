@@ -9,6 +9,7 @@ import { initializeDebugEnv } from "ext:deno_node/internal/util/debuglog.ts";
 import {
   op_getegid,
   op_geteuid,
+  op_node_load_env_file,
   op_node_process_kill,
   op_process_abort,
 } from "ext:core/ops";
@@ -17,6 +18,7 @@ import { warnNotImplemented } from "ext:deno_node/_utils.ts";
 import { EventEmitter } from "node:events";
 import Module, { getBuiltinModule } from "node:module";
 import { report } from "ext:deno_node/internal/process/report.ts";
+import { onWarning } from "ext:deno_node/internal/process/warning.ts";
 import {
   validateNumber,
   validateObject,
@@ -69,7 +71,7 @@ export let argv0 = "";
 
 export let arch = "";
 
-export let platform = "";
+export let platform = isWindows ? "win32" : ""; // initialized during bootstrap
 
 export let pid = 0;
 
@@ -82,13 +84,11 @@ import * as constants from "ext:deno_node/internal_binding/constants.ts";
 import * as uv from "ext:deno_node/internal_binding/uv.ts";
 import type { BindingName } from "ext:deno_node/internal_binding/mod.ts";
 import { buildAllowedFlags } from "ext:deno_node/internal/process/per_thread.mjs";
-import { setProcess } from "ext:deno_node/_events.mjs";
 
 const { NumberMAX_SAFE_INTEGER } = primordials;
 
 const notImplementedEvents = [
   "multipleResolves",
-  "worker",
 ];
 
 export const argv: string[] = ["", ""];
@@ -167,19 +167,19 @@ export function cpuUsage(previousValue?: CpuUsage): CpuUsage {
 
   if (previousValue) {
     if (!previousCpuUsageValueIsValid(previousValue.user)) {
-      validateObject(previousValue, "previousValue");
+      validateObject(previousValue, "prevValue");
 
-      validateNumber(previousValue.user, "previousValue.user");
+      validateNumber(previousValue.user, "prevValue.user");
       throw new ERR_INVALID_ARG_VALUE_RANGE(
-        "previousValue.user",
+        "prevValue.user",
         previousValue.user,
       );
     }
 
     if (!previousCpuUsageValueIsValid(previousValue.system)) {
-      validateNumber(previousValue.system, "previousValue.system");
+      validateNumber(previousValue.system, "prevValue.system");
       throw new ERR_INVALID_ARG_VALUE_RANGE(
-        "previousValue.system",
+        "prevValue.system",
         previousValue.system,
       );
     }
@@ -325,7 +325,8 @@ memoryUsage.rss = function (): number {
 // Returns a negative error code than can be recognized by errnoException
 function _kill(pid: number, sig: number): number {
   const maybeMapErrno = (res: number) =>
-    res === 0 ? res : uv.mapSysErrnoToUvErrno(res);
+    // the windows implementation is ported from libuv, so the error numbers already match libuv and don't need mapping
+    res === 0 ? res : isWindows ? res : uv.mapSysErrnoToUvErrno(res);
   // signal 0 does not exist in constants.os.signals, thats why it have to be handled explicitly
   if (sig === 0) {
     return maybeMapErrno(op_node_process_kill(pid, 0));
@@ -788,6 +789,12 @@ process.getBuiltinModule = getBuiltinModule;
 // TODO(kt3k): Implement this when we added -e option to node compat mode
 process._eval = undefined;
 
+export function loadEnvFile(path = ".env") {
+  return op_node_load_env_file(path);
+}
+
+process.loadEnvFile = loadEnvFile;
+
 /** https://nodejs.org/api/process.html#processexecpath */
 
 Object.defineProperty(process, "execPath", {
@@ -990,12 +997,6 @@ internals.__bootstrapNodeProcess = function (
     core.setMacrotaskCallback(runNextTicks);
     enableNextTick();
 
-    // Replace stdin if it is not a terminal
-    const newStdin = initStdin();
-    if (newStdin) {
-      stdin = process.stdin = newStdin;
-    }
-
     // Replace stdout/stderr if they are not terminals
     if (!io.stdout.isTerminal()) {
       /** https://nodejs.org/api/process.html#process_process_stdout */
@@ -1019,6 +1020,16 @@ internals.__bootstrapNodeProcess = function (
 
     initializeDebugEnv(nodeDebug);
 
+    if (getOptionValue("--warnings")) {
+      process.on("warning", onWarning);
+    }
+
+    // Replace stdin if it is not a terminal
+    const newStdin = initStdin();
+    if (newStdin) {
+      stdin = process.stdin = newStdin;
+    }
+
     delete internals.__bootstrapNodeProcess;
   } else {
     // Warmup, assuming stdin/stdout/stderr are all terminals
@@ -1039,7 +1050,5 @@ internals.__bootstrapNodeProcess = function (
     );
   }
 };
-
-setProcess(process);
 
 export default process;

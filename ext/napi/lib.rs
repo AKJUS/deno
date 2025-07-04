@@ -22,6 +22,7 @@ pub mod util;
 pub mod uv;
 
 use core::ptr::NonNull;
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 pub use std::ffi::CStr;
@@ -32,16 +33,18 @@ pub use std::ptr;
 use std::rc::Rc;
 use std::thread_local;
 
+use deno_core::ExternalOpsTracker;
+use deno_core::OpState;
+use deno_core::V8CrossThreadTaskSpawner;
 use deno_core::op2;
 use deno_core::parking_lot::RwLock;
 use deno_core::url::Url;
 // Expose common stuff for ease of use.
 // `use deno_napi::*`
 pub use deno_core::v8;
-use deno_core::ExternalOpsTracker;
-use deno_core::OpState;
-use deno_core::V8CrossThreadTaskSpawner;
 use deno_permissions::PermissionCheckError;
+pub use denort_helper::DenoRtNativeAddonLoader;
+pub use denort_helper::DenoRtNativeAddonLoaderRc;
 #[cfg(unix)]
 use libloading::os::unix::*;
 #[cfg(windows)]
@@ -56,6 +59,9 @@ pub enum NApiError {
   #[class(type)]
   #[error("Invalid path")]
   InvalidPath,
+  #[class(type)]
+  #[error(transparent)]
+  DenoRtLoad(#[from] denort_helper::LoadError),
   #[class(type)]
   #[error(transparent)]
   LibLoading(#[from] libloading::Error),
@@ -504,10 +510,16 @@ deno_core::extension!(deno_napi,
   ops = [
     op_napi_open<P>
   ],
-  state = |state| {
+  options = {
+    deno_rt_native_addon_loader: Option<DenoRtNativeAddonLoaderRc>,
+  },
+  state = |state, options| {
     state.put(NapiState {
       env_cleanup_hooks: Rc::new(RefCell::new(vec![])),
     });
+    if let Some(loader) = options.deno_rt_native_addon_loader {
+      state.put(loader);
+    }
   },
 );
 
@@ -527,6 +539,7 @@ impl NapiPermissions for deno_permissions::PermissionsContainer {
 
 unsafe impl Sync for NapiModuleHandle {}
 unsafe impl Send for NapiModuleHandle {}
+
 #[derive(Clone, Copy)]
 struct NapiModuleHandle(*const NapiModule);
 
@@ -549,7 +562,13 @@ where
 {
   // We must limit the OpState borrow because this function can trigger a
   // re-borrow through the NAPI module.
-  let (async_work_sender, cleanup_hooks, external_ops_tracker, path) = {
+  let (
+    async_work_sender,
+    cleanup_hooks,
+    external_ops_tracker,
+    deno_rt_native_addon_loader,
+    path,
+  ) = {
     let mut op_state = op_state.borrow_mut();
     let permissions = op_state.borrow_mut::<NP>();
     let path = permissions.check(&path)?;
@@ -558,6 +577,7 @@ where
       op_state.borrow::<V8CrossThreadTaskSpawner>().clone(),
       napi_state.env_cleanup_hooks.clone(),
       op_state.external_ops_tracker.clone(),
+      op_state.try_borrow::<DenoRtNativeAddonLoaderRc>().cloned(),
       path,
     )
   };
@@ -594,13 +614,18 @@ where
   #[cfg(not(unix))]
   let flags = 0x00000008;
 
+  let real_path = match deno_rt_native_addon_loader {
+    Some(loader) => loader.load_and_resolve_path(&path)?,
+    None => Cow::Borrowed(path.as_ref()),
+  };
+
   // SAFETY: opening a DLL calls dlopen
   #[cfg(unix)]
-  let library = unsafe { Library::open(Some(&path), flags) }?;
+  let library = unsafe { Library::open(Some(real_path.as_ref()), flags) }?;
 
   // SAFETY: opening a DLL calls dlopen
   #[cfg(not(unix))]
-  let library = unsafe { Library::load_with_flags(&path, flags) }?;
+  let library = unsafe { Library::load_with_flags(real_path.as_ref(), flags) }?;
 
   let maybe_module = MODULE_TO_REGISTER.with(|cell| {
     let mut slot = cell.borrow_mut();
@@ -628,14 +653,19 @@ where
     assert_eq!(nm.nm_version, 1);
     // SAFETY: we are going blind, calling the register function on the other side.
     unsafe { (nm.nm_register_func)(env_ptr, exports.into()) }
-  } else if let Ok(init) = unsafe {
-    library.get::<napi_register_module_v1>(b"napi_register_module_v1")
-  } {
-    // Initializer callback.
-    // SAFETY: we are going blind, calling the register function on the other side.
-    unsafe { init(env_ptr, exports.into()) }
   } else {
-    return Err(NApiError::ModuleNotFound(path));
+    match unsafe {
+      library.get::<napi_register_module_v1>(b"napi_register_module_v1")
+    } {
+      Ok(init) => {
+        // Initializer callback.
+        // SAFETY: we are going blind, calling the register function on the other side.
+        unsafe { init(env_ptr, exports.into()) }
+      }
+      _ => {
+        return Err(NApiError::ModuleNotFound(path));
+      }
+    }
   };
 
   let exports = maybe_exports.unwrap_or(exports.into());

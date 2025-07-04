@@ -14,8 +14,8 @@ use std::process::ChildStdin;
 use std::process::ChildStdout;
 use std::process::Command;
 use std::process::Stdio;
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -39,19 +39,19 @@ use once_cell::sync::Lazy;
 use parking_lot::Condvar;
 use parking_lot::Mutex;
 use regex::Regex;
-use serde::de;
 use serde::Deserialize;
 use serde::Serialize;
+use serde::de;
+use serde_json::Value;
 use serde_json::json;
 use serde_json::to_value;
-use serde_json::Value;
 use url::Url;
 
 use super::TempDir;
+use crate::PathRef;
 use crate::deno_exe_path;
 use crate::jsr_registry_url;
 use crate::npm_registry_url;
-use crate::PathRef;
 
 static CONTENT_TYPE_REG: Lazy<Regex> =
   lazy_regex::lazy_regex!(r"(?i)^content-length:\s+(\d+)");
@@ -916,6 +916,42 @@ impl LspClient {
 
   pub fn did_open_raw(&mut self, params: Value) {
     self.write_notification("textDocument/didOpen", params);
+  }
+
+  pub fn notebook_did_open(
+    &mut self,
+    uri: Uri,
+    version: i32,
+    cells: Vec<Value>,
+  ) -> CollectedDiagnostics {
+    let cells = cells
+      .into_iter()
+      .map(|c| serde_json::from_value::<lsp::TextDocumentItem>(c).unwrap())
+      .collect::<Vec<_>>();
+    let params = lsp::DidOpenNotebookDocumentParams {
+      notebook_document: lsp::NotebookDocument {
+        uri,
+        notebook_type: "jupyter-notebook".to_string(),
+        version,
+        metadata: None,
+        cells: cells
+          .iter()
+          .map(|c| lsp::NotebookCell {
+            kind: if c.language_id == "markdown" {
+              lsp::NotebookCellKind::Markup
+            } else {
+              lsp::NotebookCellKind::Code
+            },
+            document: c.uri.clone(),
+            metadata: None,
+            execution_summary: None,
+          })
+          .collect(),
+      },
+      cell_text_documents: cells,
+    };
+    self.write_notification("notebookDocument/didOpen", json!(params));
+    self.read_diagnostics()
   }
 
   pub fn change_configuration(&mut self, config: Value) {

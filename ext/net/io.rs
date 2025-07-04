@@ -3,7 +3,6 @@
 use std::borrow::Cow;
 use std::rc::Rc;
 
-use deno_core::futures::TryFutureExt;
 use deno_core::AsyncMutFuture;
 use deno_core::AsyncRefCell;
 use deno_core::AsyncResult;
@@ -11,6 +10,7 @@ use deno_core::CancelHandle;
 use deno_core::CancelTryFuture;
 use deno_core::RcRef;
 use deno_core::Resource;
+use deno_core::futures::TryFutureExt;
 use deno_error::JsErrorBox;
 use socket2::SockRef;
 use tokio::io::AsyncRead;
@@ -179,6 +179,47 @@ impl Resource for UnixStreamResource {
 
   fn name(&self) -> Cow<str> {
     "unixStream".into()
+  }
+
+  fn shutdown(self: Rc<Self>) -> AsyncResult<()> {
+    Box::pin(self.shutdown().map_err(JsErrorBox::from_err))
+  }
+
+  fn close(self: Rc<Self>) {
+    self.cancel_read_ops();
+  }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub type VsockStreamResource =
+  FullDuplexResource<tokio_vsock::OwnedReadHalf, tokio_vsock::OwnedWriteHalf>;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub struct VsockStreamResource;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl VsockStreamResource {
+  fn read(self: Rc<Self>, _data: &mut [u8]) -> AsyncResult<usize> {
+    unreachable!()
+  }
+  fn write(self: Rc<Self>, _data: &[u8]) -> AsyncResult<usize> {
+    unreachable!()
+  }
+  #[allow(clippy::unused_async)]
+  pub async fn shutdown(self: Rc<Self>) -> Result<(), JsErrorBox> {
+    unreachable!()
+  }
+  pub fn cancel_read_ops(&self) {
+    unreachable!()
+  }
+}
+
+impl Resource for VsockStreamResource {
+  deno_core::impl_readable_byob!();
+  deno_core::impl_writable!();
+
+  fn name(&self) -> Cow<str> {
+    "vsockStream".into()
   }
 
   fn shutdown(self: Rc<Self>) -> AsyncResult<()> {

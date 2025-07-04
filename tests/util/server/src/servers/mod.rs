@@ -9,8 +9,8 @@ use std::net::SocketAddr;
 use std::result::Result;
 use std::time::Duration;
 
-use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use bytes::Bytes;
 use denokv_proto::datapath::AtomicWrite;
 use denokv_proto::datapath::AtomicWriteOutput;
@@ -28,10 +28,11 @@ use http::Method;
 use http::Request;
 use http::Response;
 use http::StatusCode;
-use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::BodyExt;
 use http_body_util::Empty;
 use http_body_util::Full;
+use http_body_util::combinators::UnsyncBoxBody;
+use hyper_utils::run_server_with_remote_addr;
 use pretty_assertions::assert_eq;
 use prost::Message;
 use tokio::io::AsyncWriteExt;
@@ -44,13 +45,13 @@ mod nodejs_org_mirror;
 mod npm_registry;
 mod ws;
 
-use hyper_utils::run_server;
-use hyper_utils::run_server_with_acceptor;
 use hyper_utils::ServerKind;
 use hyper_utils::ServerOptions;
+use hyper_utils::run_server;
+use hyper_utils::run_server_with_acceptor;
 
-use super::https::get_tls_listener_stream;
 use super::https::SupportedHttpVersions;
+use super::https::get_tls_listener_stream;
 use super::std_path;
 use super::testdata_path;
 use crate::TEST_SERVERS_COUNT;
@@ -452,6 +453,7 @@ async fn absolute_redirect(
 
 async fn main_server(
   req: Request<hyper::body::Incoming>,
+  remote_addr: SocketAddr,
 ) -> Result<Response<UnsyncBoxBody<Bytes, Infallible>>, anyhow::Error> {
   match (req.method(), req.uri().path()) {
     (_, "/echo_server") => {
@@ -465,6 +467,11 @@ async fn main_server(
           StatusCode::from_bytes(status.as_bytes()).unwrap();
       }
       response.headers_mut().extend(parts.headers);
+      Ok(response)
+    }
+    (_, "/local_addr") => {
+      let addr = remote_addr.ip().to_string();
+      let response = Response::new(string_body(&addr));
       Ok(response)
     }
     (&Method::POST, "/echo_multipart_file") => {
@@ -744,7 +751,9 @@ async fn main_server(
       Ok(res)
     }
     (_, "/referenceTypes.js") => {
-      let mut res = Response::new(string_body("/// <reference types=\"./xTypeScriptTypes.d.ts\" />\r\nexport const foo = \"foo\";\r\n"));
+      let mut res = Response::new(string_body(
+        "/// <reference types=\"./xTypeScriptTypes.d.ts\" />\r\nexport const foo = \"foo\";\r\n",
+      ));
       res.headers_mut().insert(
         "Content-type",
         HeaderValue::from_static("application/javascript"),
@@ -1268,7 +1277,7 @@ async fn wrap_abs_redirect_server(port: u16) {
 
 async fn wrap_main_server(port: u16) {
   let main_server_addr = SocketAddr::from(([127, 0, 0, 1], port));
-  run_server(
+  run_server_with_remote_addr(
     ServerOptions {
       addr: main_server_addr,
       kind: ServerKind::Auto,
@@ -1284,7 +1293,7 @@ async fn wrap_main_https_server(port: u16) {
   let tls_acceptor = tls.boxed_local();
   run_server_with_acceptor(
     tls_acceptor,
-    main_server,
+    move |req| main_server(req, SocketAddr::from(([127, 0, 0, 1], port))),
     "HTTPS server error",
     ServerKind::Auto,
   )
@@ -1301,7 +1310,7 @@ async fn wrap_https_h1_only_tls_server(port: u16) {
 
   run_server_with_acceptor(
     tls.boxed_local(),
-    main_server,
+    move |req| main_server(req, SocketAddr::from(([127, 0, 0, 1], port))),
     "HTTP1 only TLS server error",
     ServerKind::OnlyHttp1,
   )
@@ -1318,7 +1327,7 @@ async fn wrap_https_h2_only_tls_server(port: u16) {
 
   run_server_with_acceptor(
     tls.boxed_local(),
-    main_server,
+    move |req| main_server(req, SocketAddr::from(([127, 0, 0, 1], port))),
     "HTTP2 only TLS server error",
     ServerKind::OnlyHttp2,
   )
@@ -1333,7 +1342,7 @@ async fn wrap_http_h1_only_server(port: u16) {
       error_msg: "HTTP1 only server error:",
       kind: ServerKind::OnlyHttp1,
     },
-    main_server,
+    move |req| main_server(req, SocketAddr::from(([127, 0, 0, 1], port))),
   )
   .await;
 }
@@ -1346,7 +1355,7 @@ async fn wrap_http_h2_only_server(port: u16) {
       error_msg: "HTTP1 only server error:",
       kind: ServerKind::OnlyHttp2,
     },
-    main_server,
+    move |req| main_server(req, SocketAddr::from(([127, 0, 0, 1], port))),
   )
   .await;
 }
@@ -1371,7 +1380,7 @@ async fn wrap_client_auth_https_server(port: u16) {
 
   run_server_with_acceptor(
     tls.boxed_local(),
-    main_server,
+    move |req| main_server(req, SocketAddr::from(([127, 0, 0, 1], port))),
     "Auth TLS server error",
     ServerKind::Auto,
   )
@@ -1416,7 +1425,7 @@ pub fn custom_headers(
   if p.contains("/encoding/") {
     let charset = p
       .split_terminator('/')
-      .last()
+      .next_back()
       .unwrap()
       .trim_end_matches(".ts");
 

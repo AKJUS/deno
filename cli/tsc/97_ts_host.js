@@ -23,15 +23,6 @@ function spanned(name, f) {
   }
 }
 
-// The map from the normalized specifier to the original.
-// TypeScript normalizes the specifier in its internal processing,
-// but the original specifier is needed when looking up the source from the runtime.
-// This map stores that relationship, and the original can be restored by the
-// normalized specifier.
-// See: https://github.com/denoland/deno/issues/9277#issuecomment-769653834
-/** @type {Map<string, string>} */
-const normalizedToOriginalMap = new Map();
-
 /** @type {ReadonlySet<string>} */
 const unstableDenoProps = new Set([
   "AtomicOperation",
@@ -88,7 +79,7 @@ export function setLogDebug(debug, source) {
 }
 
 /** @param msg {string} */
-function printStderr(msg) {
+export function printStderr(msg) {
   core.print(msg, true);
 }
 
@@ -131,7 +122,7 @@ export function assert(cond, msg = "Assertion failed.") {
 /** @type {Map<string, ts.SourceFile>} */
 export const SOURCE_FILE_CACHE = new Map();
 
-/** @type {Map<string, ts.IScriptSnapshot & { isCjs?: boolean; }>} */
+/** @type {Map<string, ts.IScriptSnapshot & { isCjs?: boolean; isClassicScript?: boolean; }>} */
 export const SCRIPT_SNAPSHOT_CACHE = new Map();
 
 /** @type {Map<string, number>} */
@@ -171,6 +162,15 @@ export const LAST_REQUEST_SCOPE = {
   get: () => lastRequestScope,
   set: (scope) => {
     lastRequestScope = scope;
+  },
+};
+
+/** @type {string | null} */
+let lastRequestNotebookUri = null;
+export const LAST_REQUEST_NOTEBOOK_URI = {
+  get: () => lastRequestNotebookUri,
+  set: (notebookUri) => {
+    lastRequestNotebookUri = notebookUri;
   },
 };
 
@@ -379,14 +379,15 @@ class CancellationToken {
  *    ls: ts.LanguageService & { [k:string]: any },
  *    compilerOptions: ts.CompilerOptions,
  *  }} LanguageServiceEntry */
-/** @type {{ unscoped: LanguageServiceEntry, byScope: Map<string, LanguageServiceEntry> }} */
+/** @type {{ unscoped: LanguageServiceEntry, byScope: Map<string, LanguageServiceEntry>, byNotebookUri: Map<string, LanguageServiceEntry> }} */
 export const LANGUAGE_SERVICE_ENTRIES = {
   // @ts-ignore Will be set later.
   unscoped: null,
   byScope: new Map(),
+  byNotebookUri: new Map(),
 };
 
-/** @type {{ unscoped: string[], byScope: Map<string, string[]> } | null} */
+/** @type {{ unscoped: string[], byScope: Map<string, string[]>, byNotebookUri: Map<string, string[]> } | null} */
 let SCRIPT_NAMES_CACHE = null;
 
 export function clearScriptNamesCache() {
@@ -460,9 +461,6 @@ const hostImpl = {
         })`,
       );
     }
-
-    // Needs the original specifier
-    specifier = normalizedToOriginalMap.get(specifier) ?? specifier;
 
     let sourceFile = SOURCE_FILE_CACHE.get(specifier);
     if (sourceFile) {
@@ -606,14 +604,35 @@ const hostImpl = {
     containingSourceFile,
     _reusedNames,
   ) {
-    const specifiers = moduleLiterals.map((literal) => [
-      ts.getModeForUsageLocation(
-        containingSourceFile,
-        literal,
-        compilerOptions,
-      ) === ts.ModuleKind.CommonJS,
-      literal.text,
-    ]);
+    const specifiers = moduleLiterals.map((literal) => {
+      const rawKind = getModuleLiteralImportKind(literal);
+      if (rawKind != null) {
+        // hack to get the specifier keyed differently until
+        // https://github.com/microsoft/TypeScript/issues/61941 is resolved
+        if (!literal.text.includes("?")) {
+          literal.text += `?${rawKind}`;
+        } else if (
+          !literal.text.includes(`?${rawKind}`) &&
+          !literal.text.includes(`&${rawKind}`)
+        ) {
+          literal.text += `&${rawKind}`;
+        }
+        return [
+          false,
+          rawKind === "text"
+            ? "asset:///text_import.d.ts"
+            : "asset:///bytes_import.d.ts",
+        ];
+      }
+      return [
+        ts.getModeForUsageLocation(
+          containingSourceFile,
+          literal,
+          compilerOptions,
+        ) === ts.ModuleKind.CommonJS,
+        literal.text,
+      ];
+    });
     if (logDebug) {
       debug(`host.resolveModuleNames()`);
       debug(`  base: ${base}`);
@@ -668,16 +687,22 @@ const hostImpl = {
       debug("host.getScriptFileNames()");
     }
     if (!SCRIPT_NAMES_CACHE) {
-      const { unscoped, byScope } = ops.op_script_names();
+      const { unscoped, byScope, byNotebookUri } = ops.op_script_names();
       SCRIPT_NAMES_CACHE = {
         unscoped,
         byScope: new Map(Object.entries(byScope)),
+        byNotebookUri: new Map(Object.entries(byNotebookUri)),
       };
     }
     const lastRequestScope = LAST_REQUEST_SCOPE.get();
-    return (lastRequestScope
-      ? SCRIPT_NAMES_CACHE.byScope.get(lastRequestScope)
-      : null) ?? SCRIPT_NAMES_CACHE.unscoped;
+    const lastRequestNotebookUri = LAST_REQUEST_NOTEBOOK_URI.get();
+    return (lastRequestNotebookUri
+      ? SCRIPT_NAMES_CACHE.byNotebookUri.get(lastRequestNotebookUri)
+      : null) ??
+      (lastRequestScope
+        ? SCRIPT_NAMES_CACHE.byScope.get(lastRequestScope)
+        : null) ??
+      SCRIPT_NAMES_CACHE.unscoped;
   },
   getScriptVersion(specifier) {
     if (logDebug) {
@@ -714,13 +739,14 @@ const hostImpl = {
     }
     let scriptSnapshot = SCRIPT_SNAPSHOT_CACHE.get(specifier);
     if (scriptSnapshot == undefined) {
-      /** @type {{ data: string, version: string, isCjs: boolean }} */
+      /** @type {{ data: string, version: string, isCjs: boolean, isClassicScript: boolean }} */
       const fileInfo = ops.op_load(specifier);
       if (!fileInfo) {
         return undefined;
       }
       scriptSnapshot = ts.ScriptSnapshot.fromString(fileInfo.data);
       scriptSnapshot.isCjs = fileInfo.isCjs;
+      scriptSnapshot.isClassicScript = fileInfo.isClassicScript;
       SCRIPT_SNAPSHOT_CACHE.set(specifier, scriptSnapshot);
       SCRIPT_VERSION_CACHE.set(specifier, fileInfo.version);
     }
@@ -794,6 +820,13 @@ export function filterMapDiagnostic(diagnostic) {
     (diagnostic.file == null || !isNodeSourceFile(diagnostic.file))
   ) {
     return false;
+  }
+  const isClassicScript = !diagnostic.file?.["externalModuleIndicator"];
+  if (isClassicScript) {
+    // Top-level-await, standard and loops.
+    if (diagnostic.code == 1375 || diagnostic.code == 1431) {
+      return false;
+    }
   }
   // make the diagnostic for using an `export =` in an es module a warning
   if (diagnostic.code === 1203) {
@@ -900,3 +933,94 @@ const setTypesNodeIgnorableNames = new Set([
   "WritableStreamDefaultWriter",
 ]);
 ts.deno.setTypesNodeIgnorableNames(setTypesNodeIgnorableNames);
+
+/**
+ * @param {ts.StringLiteralLike} node
+ * @returns {"text" | "bytes" | undefined}
+ */
+function getModuleLiteralImportKind(node) {
+  const parent = node.parent;
+  if (!parent) {
+    return undefined;
+  }
+  if (ts.isImportDeclaration(parent) || ts.isExportDeclaration(parent)) {
+    const elements = parent.attributes?.elements;
+    if (!elements) {
+      return undefined;
+    }
+    for (const element of elements) {
+      const value = getRawImportAttributeValue(element);
+      if (value) {
+        return value;
+      }
+    }
+    return undefined;
+  } else if (ts.isCallExpression(parent)) {
+    if (
+      parent.expression.kind !== ts.SyntaxKind.ImportKeyword ||
+      parent.arguments.length <= 1 ||
+      parent.arguments[0].kind !== ts.SyntaxKind.StringLiteral ||
+      parent.arguments[1].kind !== ts.SyntaxKind.ObjectLiteralExpression
+    ) {
+      return undefined;
+    }
+    const ole = /** @type {ts.ObjectLiteralExpression} */ (parent.arguments[1]);
+    const withExpr = ole.properties.find((p) =>
+      ts.isPropertyAssignment(p) && isStrOrIdentWithText(p.name, "with")
+    );
+    if (!withExpr) {
+      return undefined;
+    }
+    const withInitializer =
+      (/** @type {ts.PropertyAssignment} */ (withExpr)).initializer;
+    if (!ts.isObjectLiteralExpression(withInitializer)) {
+      return undefined;
+    }
+    const typeProp = withInitializer.properties.find((p) =>
+      ts.isPropertyAssignment(p) && isStrOrIdentWithText(p.name, "type")
+    );
+    if (!typeProp) {
+      return undefined;
+    }
+    const typeInitializer =
+      (/** @type {ts.PropertyAssignment} */ (typeProp)).initializer;
+    return getRawTypeValue(typeInitializer);
+  } else {
+    return undefined;
+  }
+}
+
+/** @param {ts.ImportAttribute} node */
+function getRawImportAttributeValue(node) {
+  if (!isStrOrIdentWithText(node.name, "type")) {
+    return undefined;
+  }
+
+  return getRawTypeValue(node.value);
+}
+
+/**
+ * @param {ts.Node} node
+ * @returns {"bytes" | "text" | undefined}
+ */
+function getRawTypeValue(node) {
+  return ts.isStringLiteral(node) &&
+      (node.text === "bytes" || node.text === "text")
+    ? node.text
+    : undefined;
+}
+
+/**
+ * @param {ts.Node} node
+ * @param {string} text
+ * @returns {boolean}
+ */
+function isStrOrIdentWithText(node, text) {
+  if (ts.isStringLiteral(node)) {
+    return node.text === text;
+  } else if (ts.isIdentifier(node)) {
+    return node.escapedText === text;
+  } else {
+    return false;
+  }
+}

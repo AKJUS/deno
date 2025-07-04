@@ -5,7 +5,6 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 
-use deno_core::op2;
 use deno_core::AsyncRefCell;
 use deno_core::CancelHandle;
 use deno_core::CancelTryFuture;
@@ -14,16 +13,17 @@ use deno_core::OpState;
 use deno_core::RcRef;
 use deno_core::Resource;
 use deno_core::ResourceId;
+use deno_core::op2;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::net::UnixDatagram;
 use tokio::net::UnixListener;
 pub use tokio::net::UnixStream;
 
+use crate::NetPermissions;
 use crate::io::UnixStreamResource;
 use crate::ops::NetError;
 use crate::raw::NetworkListenerResource;
-use crate::NetPermissions;
 
 /// A utility function to map OsStrings to Strings
 pub fn into_string(s: std::ffi::OsString) -> Result<String, NetError> {
@@ -102,11 +102,11 @@ where
       .borrow_mut::<NP>()
       .check_read(&address_path, "Deno.connect()")
       .map_err(NetError::Permission)?;
-    _ = state_
+
+    state_
       .borrow_mut::<NP>()
-      .check_write_path(&address_path, "Deno.connect()")
-      .map_err(NetError::Permission)?;
-    address_path
+      .check_write_path(Cow::Owned(address_path), "Deno.connect()")
+      .map_err(NetError::Permission)?
   };
   let unix_stream = UnixStream::connect(&address_path).await?;
   let local_addr = unix_stream.local_addr()?;
@@ -188,8 +188,8 @@ where
   let address_path = permissions
     .check_read(&address_path, &api_call_expr)
     .map_err(NetError::Permission)?;
-  _ = permissions
-    .check_write_path(&address_path, &api_call_expr)
+  let address_path = permissions
+    .check_write_path(Cow::Owned(address_path), &api_call_expr)
     .map_err(NetError::Permission)?;
   let listener = UnixListener::bind(address_path)?;
   let local_addr = listener.local_addr()?;
@@ -210,8 +210,8 @@ where
   let address_path = permissions
     .check_read(&address_path, "Deno.listenDatagram()")
     .map_err(NetError::Permission)?;
-  _ = permissions
-    .check_write_path(&address_path, "Deno.listenDatagram()")
+  let address_path = permissions
+    .check_write_path(Cow::Owned(address_path), "Deno.listenDatagram()")
     .map_err(NetError::Permission)?;
   let socket = UnixDatagram::bind(address_path)?;
   let local_addr = socket.local_addr()?;
